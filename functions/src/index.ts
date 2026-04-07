@@ -7,6 +7,7 @@ import * as nodemailer from 'nodemailer';
 import twilio from 'twilio';
 import express from 'express';
 import * as bodyParser from 'body-parser';
+const PdfPrinter = require('pdfmake');
 
 
 // Initialize Firebase Admin SDK
@@ -35,6 +36,9 @@ const teamMembers: { [phoneNumber: string]: string } = {
     '+15592136764': 'Julia',
     '+15592419140': 'Inocencio'
 };
+
+const RICHARD_EMAIL = 'RichardSV15@gmail.com';
+const RICHARD_PHONE = '+15595675330';
 
 
 // ── Utility Helpers ──
@@ -72,6 +76,427 @@ function capitalize(str: string): string {
     if (!str) return str;
     return str.charAt(0).toUpperCase() + str.slice(1);
 }
+
+function flattenChecklistItems(data: any): Array<{ key: string; label: string; flagged: boolean; photoUrls: string[] }> {
+    const items: Array<{ key: string; label: string; flagged: boolean; photoUrls: string[] }> = [];
+    const sections = Array.isArray(data?.sections) ? data.sections : [];
+
+    sections.forEach((section: any) => {
+        const sectionId = String(section?.sectionId || section?.id || 'section');
+        const sectionItems = Array.isArray(section?.items) ? section.items : [];
+        sectionItems.forEach((item: any) => {
+            items.push({
+                key: `${sectionId}:${String(item?.id || item?.label || 'item')}`,
+                label: String(item?.label || item?.id || 'Checklist item'),
+                flagged: Boolean(item?.flagged),
+                photoUrls: Array.isArray(item?.photoUrls) ? item.photoUrls : [],
+            });
+        });
+    });
+
+    return items;
+}
+
+function getNewHazards(beforeData: any, afterData: any): any[] {
+    const beforeIds = new Set(
+        (Array.isArray(beforeData?.hazards) ? beforeData.hazards : []).map((hazard: any) =>
+            String(hazard?.id || '')
+        )
+    );
+
+    return (Array.isArray(afterData?.hazards) ? afterData.hazards : []).filter(
+        (hazard: any) => !beforeIds.has(String(hazard?.id || ''))
+    );
+}
+
+function getNewFlaggedItems(beforeData: any, afterData: any): Array<{ label: string; photoUrls: string[] }> {
+    const beforeMap = new Map(
+        flattenChecklistItems(beforeData).map((item) => [item.key, item])
+    );
+
+    return flattenChecklistItems(afterData)
+        .filter((item) => item.flagged && !beforeMap.get(item.key)?.flagged)
+        .map((item) => ({
+            label: item.label,
+            photoUrls: item.photoUrls,
+        }));
+}
+
+function getPdfFonts() {
+    return {
+        Helvetica: {
+            normal: 'Helvetica',
+            bold: 'Helvetica-Bold',
+            italics: 'Helvetica-Oblique',
+            bolditalics: 'Helvetica-BoldOblique',
+        },
+    };
+}
+
+function createPdfBuffer(docDefinition: any): Promise<Buffer> {
+    const printer = new PdfPrinter(getPdfFonts());
+    const pdfDoc = printer.createPdfKitDocument(docDefinition);
+    const chunks: Buffer[] = [];
+
+    return new Promise((resolve, reject) => {
+        pdfDoc.on('data', (chunk: Buffer) => chunks.push(chunk));
+        pdfDoc.on('end', () => resolve(Buffer.concat(chunks)));
+        pdfDoc.on('error', reject);
+        pdfDoc.end();
+    });
+}
+
+function buildChecklistPdfDefinition(checklistId: string, checklist: any, title?: string) {
+    const sections = Array.isArray(checklist?.sections) ? checklist.sections : [];
+    const hazards = Array.isArray(checklist?.hazards) ? checklist.hazards : [];
+    const signature = checklist?.signature || null;
+    const generatedTitle = title || `DES Checklist Report`;
+    const content: any[] = [
+        { text: 'Suarez Lawn Services', style: 'header' },
+        { text: generatedTitle, style: 'subheader' },
+        {
+            columns: [
+                [
+                    { text: `Checklist ID: ${checklistId}` },
+                    { text: `Truck: ${checklist?.truckDisplayName || checklist?.truckId || 'N/A'}` },
+                    { text: `Department: ${capitalize(checklist?.department || 'n/a')}` },
+                ],
+                [
+                    { text: `Date: ${checklist?.date || 'N/A'}` },
+                    { text: `Status: ${String(checklist?.status || 'N/A').replace('_', ' ')}` },
+                    { text: `Completed By: ${checklist?.completedByName || 'N/A'}` },
+                ],
+            ],
+            columnGap: 20,
+            margin: [0, 0, 0, 12],
+        },
+    ];
+
+    sections.forEach((section: any) => {
+        content.push({ text: section?.title || 'Section', style: 'sectionHeader' });
+        const items = Array.isArray(section?.items) ? section.items : [];
+        if (items.length === 0) {
+            content.push({ text: 'No items recorded.', margin: [0, 0, 0, 8] });
+        } else {
+            content.push({
+                margin: [0, 0, 0, 8],
+                layout: 'lightHorizontalLines',
+                table: {
+                    widths: [20, '*', 55, 55],
+                    body: [
+                        [
+                            { text: '', bold: true },
+                            { text: 'Item', bold: true },
+                            { text: 'Source', bold: true },
+                            { text: 'Status', bold: true },
+                        ],
+                        ...items.map((item: any) => [
+                            { text: item?.checked ? '☑' : '☐', alignment: 'center' },
+                            { text: item?.label || 'Item' },
+                            { text: item?.source || 'base' },
+                            { text: item?.flagged ? 'Flagged' : item?.checked ? 'Checked' : 'Unchecked' },
+                        ]),
+                    ],
+                },
+            });
+        }
+
+        if (section?.weatherData) {
+            content.push({
+                margin: [0, 0, 0, 8],
+                text: `Weather: High ${section.weatherData.highTemp || 0}°F · Shade Ready: ${section.weatherData.shadeReady ? 'Yes' : 'No'} · Buddy System: ${section.weatherData.buddySystemOn ? 'Yes' : 'No'}`,
+            });
+        }
+    });
+
+    content.push({ text: 'Hazards', style: 'sectionHeader' });
+    content.push({
+        margin: [0, 0, 0, 8],
+        layout: 'lightHorizontalLines',
+        table: {
+            widths: [55, 90, '*', '*', 45, 60],
+            body: [
+                [
+                    { text: 'Time', bold: true },
+                    { text: 'Location', bold: true },
+                    { text: 'Hazard', bold: true },
+                    { text: 'Corrective Action', bold: true },
+                    { text: 'Fixed', bold: true },
+                    { text: 'Date', bold: true },
+                ],
+                ...(hazards.length > 0
+                    ? hazards.map((hazard: any) => [
+                        { text: hazard?.time || 'N/A' },
+                        { text: hazard?.location || 'N/A' },
+                        { text: hazard?.hazardFound || 'N/A' },
+                        { text: hazard?.correctiveAction || 'N/A' },
+                        { text: hazard?.fixed ? 'Yes' : 'No' },
+                        { text: hazard?.fixedDate || '—' },
+                    ])
+                    : [[
+                        { text: '—' },
+                        { text: '—' },
+                        { text: 'No hazards recorded', colSpan: 4 },
+                        {},
+                        {},
+                        {},
+                    ]]),
+            ],
+        },
+    });
+
+    content.push({ text: 'Digital Signature', style: 'sectionHeader' });
+    content.push({
+        text: signature
+            ? `Employee: ${signature.employeeName} (${signature.employeeUid}) · Phone: ${signature.employeePhone} · Timestamp: ${formatDate(signature.timestamp)}`
+            : 'No submission signature recorded.',
+        margin: [0, 0, 0, 8],
+    });
+
+    content.push({
+        text: 'Legal basis: Cal/OSHA inspection records maintained electronically with authenticated submission, attribution, integrity, and retention.',
+        style: 'footerNote',
+    });
+
+    return {
+        pageMargins: [32, 32, 32, 32],
+        content,
+        styles: {
+            header: { fontSize: 18, bold: true },
+            subheader: { fontSize: 13, margin: [0, 4, 0, 12] },
+            sectionHeader: { fontSize: 12, bold: true, margin: [0, 8, 0, 6] },
+            footerNote: { fontSize: 9, italics: true, margin: [0, 12, 0, 0] },
+        },
+        defaultStyle: {
+            font: 'Helvetica',
+            fontSize: 10,
+        },
+    };
+}
+
+async function uploadPdfBuffer(storagePath: string, buffer: Buffer): Promise<string> {
+    const bucket = admin.storage().bucket();
+    const token = admin.firestore().collection('_').doc().id;
+    const file = bucket.file(storagePath);
+
+    await file.save(buffer, {
+        resumable: false,
+        metadata: {
+            contentType: 'application/pdf',
+            metadata: {
+                firebaseStorageDownloadTokens: token,
+            },
+        },
+    });
+
+    return `https://firebasestorage.googleapis.com/v0/b/${bucket.name}/o/${encodeURIComponent(storagePath)}?alt=media&token=${token}`;
+}
+
+async function generateChecklistPdfFile(checklistId: string, title?: string): Promise<{ pdfUrl: string; buffer: Buffer }> {
+    const doc = await admin.firestore().collection('checklists').doc(checklistId).get();
+    if (!doc.exists) {
+        throw new Error('Checklist not found');
+    }
+
+    const checklist = doc.data()!;
+    const pdfBuffer = await createPdfBuffer(
+        buildChecklistPdfDefinition(checklistId, checklist, title)
+    );
+    const pdfUrl = await uploadPdfBuffer(`checklists/${checklistId}/report.pdf`, pdfBuffer);
+
+    return { pdfUrl, buffer: pdfBuffer };
+}
+
+function getPreviousMonthRange() {
+    const now = new Date();
+    const start = new Date(now.getFullYear(), now.getMonth() - 1, 1);
+    const end = new Date(now.getFullYear(), now.getMonth(), 1);
+    return {
+        start: start.toISOString().slice(0, 10),
+        end: end.toISOString().slice(0, 10),
+        label: start.toLocaleString('en-US', {
+            month: 'long',
+            year: 'numeric',
+            timeZone: 'America/Los_Angeles',
+        }),
+    };
+}
+
+export const onChecklistHazardOrDefectReported = functions
+    .runWith({ secrets: allSecrets })
+    .firestore
+    .document('checklists/{checklistId}')
+    .onUpdate(async (change, context) => {
+        const beforeData = change.before.data();
+        const afterData = change.after.data();
+
+        if (!beforeData || !afterData) return null;
+
+        const newHazards = getNewHazards(beforeData, afterData);
+        const newFlaggedItems = getNewFlaggedItems(beforeData, afterData);
+
+        if (newHazards.length === 0 && newFlaggedItems.length === 0) {
+            return null;
+        }
+
+        const checklistId = context.params.checklistId;
+        const adminLink = `https://www.suarezlawnservices.com/admin/checklists`;
+        const truckName = afterData.truckDisplayName || afterData.truckId || checklistId;
+        const employeeName = afterData.completedByName || afterData.signature?.employeeName || 'Field employee';
+
+        const hazardHtml = newHazards.map((hazard: any) => `
+            <li><strong>Hazard:</strong> ${hazard.hazardFound || 'N/A'}<br />
+            Location: ${hazard.location || 'N/A'} · Fixed: ${hazard.fixed ? 'Yes' : 'No'}<br />
+            Photos: ${(hazard.photoUrls || []).join(', ') || 'None'}</li>
+        `).join('');
+
+        const flaggedHtml = newFlaggedItems.map((item) => `
+            <li><strong>Flagged Item:</strong> ${item.label}<br />
+            Photos: ${item.photoUrls.join(', ') || 'None'}</li>
+        `).join('');
+
+        const html = `
+            <h2>Checklist Hazard / Defect Alert</h2>
+            <p>A new hazard or flagged defect was reported.</p>
+            <p><strong>Truck:</strong> ${truckName}<br />
+            <strong>Employee:</strong> ${employeeName}<br />
+            <strong>Date:</strong> ${afterData.date || 'N/A'}</p>
+            ${newHazards.length > 0 ? `<h3>New Hazards</h3><ul>${hazardHtml}</ul>` : ''}
+            ${newFlaggedItems.length > 0 ? `<h3>New Flagged Items</h3><ul>${flaggedHtml}</ul>` : ''}
+            <p><a href="${adminLink}">Open Admin Checklist View</a></p>
+        `;
+
+        const smsBody = [
+            'SLS: Checklist alert',
+            '',
+            `Truck: ${truckName}`,
+            `Employee: ${employeeName}`,
+            `Date: ${afterData.date || 'N/A'}`,
+            ...newHazards.map((hazard: any) => `Hazard: ${hazard.hazardFound || 'N/A'}`),
+            ...newFlaggedItems.map((item) => `Flagged: ${item.label}`),
+            adminLink,
+        ].join('\n');
+
+        await sendEmail(
+            `Checklist Alert - ${truckName}`,
+            html,
+            { to: [RICHARD_EMAIL] }
+        );
+        await sendSMS(
+            smsBody,
+            { to: [RICHARD_PHONE] }
+        );
+
+        return null;
+    });
+
+export const generateChecklistPdf = functions
+    .https.onRequest(async (req, res) => {
+        if (req.method !== 'POST') {
+            res.status(405).json({ error: 'Method not allowed' });
+            return;
+        }
+
+        try {
+            const checklistId = String(req.body?.checklistId || '').trim();
+            if (!checklistId) {
+                res.status(400).json({ error: 'checklistId is required' });
+                return;
+            }
+
+            const result = await generateChecklistPdfFile(checklistId);
+            res.status(200).json(result);
+        } catch (error: any) {
+            console.error('Error generating checklist PDF:', error);
+            res.status(500).json({ error: error?.message || 'Failed to generate checklist PDF' });
+        }
+    });
+
+export const monthlyChecklistReport = functions
+    .runWith({ secrets: allSecrets })
+    .pubsub.schedule('0 8 1 * *')
+    .timeZone('America/Los_Angeles')
+    .onRun(async () => {
+        const range = getPreviousMonthRange();
+        const snapshot = await admin.firestore()
+            .collection('checklists')
+            .where('date', '>=', range.start)
+            .where('date', '<', range.end)
+            .get();
+
+        const checklists = snapshot.docs.map((doc) => ({
+            id: doc.id,
+            ...doc.data(),
+        }));
+
+        if (checklists.length === 0) {
+            await sendEmail(
+                `Monthly Checklist Report - ${range.label}`,
+                `<p>No checklists were recorded for ${range.label}.</p>`,
+                { to: ['SuarezLawnServices.LLC@gmail.com'] }
+            );
+            return null;
+        }
+
+        const summaryDefinition = {
+            pageMargins: [32, 32, 32, 32],
+            content: [
+                { text: 'Suarez Lawn Services', style: 'header' },
+                { text: `Monthly Checklist Report - ${range.label}`, style: 'subheader' },
+                {
+                    table: {
+                        widths: ['*', 80, 90, 80],
+                        body: [
+                            [
+                                { text: 'Truck', bold: true },
+                                { text: 'Date', bold: true },
+                                { text: 'Status', bold: true },
+                                { text: 'Hazards', bold: true },
+                            ],
+                            ...checklists.map((entry: any) => [
+                                { text: entry.truckDisplayName || entry.truckId || entry.id },
+                                { text: entry.date || 'N/A' },
+                                { text: String(entry.status || 'N/A').replace('_', ' ') },
+                                { text: String((entry.hazards || []).length) },
+                            ]),
+                        ],
+                    },
+                },
+                ...checklists.flatMap((entry: any, index: number) => ([
+                    { text: '', pageBreak: index === 0 ? undefined : 'before' },
+                    ...buildChecklistPdfDefinition(entry.id, entry, `Checklist ${index + 1}`).content,
+                ])),
+            ],
+            styles: {
+                header: { fontSize: 18, bold: true },
+                subheader: { fontSize: 13, margin: [0, 4, 0, 12] },
+            },
+            defaultStyle: {
+                font: 'Helvetica',
+                fontSize: 10,
+            },
+        };
+
+        const pdfBuffer = await createPdfBuffer(summaryDefinition);
+        const attachmentName = `monthly-checklists-${range.start}.pdf`;
+
+        await sendEmail(
+            `Monthly Checklist Report - ${range.label}`,
+            `<p>Attached is the checklist report for ${range.label}.</p>`,
+            {
+                to: ['SuarezLawnServices.LLC@gmail.com'],
+                attachments: [
+                    {
+                        filename: attachmentName,
+                        content: pdfBuffer,
+                        contentType: 'application/pdf',
+                    },
+                ],
+            }
+        );
+
+        return null;
+    });
 
 
 /**
@@ -731,7 +1156,14 @@ export const handleIncomingSms = functions
  * @param {string} html - The email body in HTML format.
  * @return {Promise<void>} - A promise that resolves when the email is sent.
  */
-async function sendEmail(subject: string, html: string): Promise<void> {
+async function sendEmail(
+    subject: string,
+    html: string,
+    options?: {
+        to?: string[];
+        attachments?: nodemailer.SendMailOptions['attachments'];
+    }
+): Promise<void> {
     const transporter = nodemailer.createTransport({
         service: 'gmail',
         auth: {
@@ -742,9 +1174,10 @@ async function sendEmail(subject: string, html: string): Promise<void> {
 
     const mailOptions = {
         from: 'RichardSV15@gmail.com',  // Sender address from config
-        to: recipientEmails.join(', '),   // List of recipients
+        to: (options?.to || recipientEmails).join(', '),   // List of recipients
         subject: subject,                // Subject line
-        html: html                       // HTML body
+        html: html,                      // HTML body
+        attachments: options?.attachments,
     };
 
     await transporter.sendMail(mailOptions);
@@ -756,9 +1189,15 @@ async function sendEmail(subject: string, html: string): Promise<void> {
  * @param {string} body - The SMS message body.
  * @return {Promise<void>} - A promise that resolves when all SMS messages are sent.
  */
-async function sendSMS(body: string): Promise<void> {
+async function sendSMS(
+    body: string,
+    options?: {
+        to?: string[];
+    }
+): Promise<void> {
     const client = twilio(twilioSid.value(), twilioToken.value());
-    const sendSMSPromises = recipientPhoneNumbers.map(async (phoneNumber) => {
+    const targets = options?.to || recipientPhoneNumbers;
+    const sendSMSPromises = targets.map(async (phoneNumber) => {
         await client.messages.create({
             body: body,
             from: twilioPhone.value(),
