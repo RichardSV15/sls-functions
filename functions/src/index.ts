@@ -52,13 +52,24 @@ function formatPlanType(planType: string): string {
 
 /** Format cents to dollar string */
 function formatPrice(cents: number): string {
+    if (typeof cents !== 'number' || !Number.isFinite(cents)) return 'N/A';
     return `$${(cents / 100).toFixed(2)}`;
+}
+
+/** Coerce a Firestore Timestamp, ISO string, Date, or epoch ms into a Date (or null if invalid) */
+function toDateSafe(dateValue: any): Date | null {
+    if (dateValue === null || dateValue === undefined) return null;
+    const date = typeof dateValue.toDate === 'function'
+        ? dateValue.toDate()
+        : new Date(dateValue);
+    if (!(date instanceof Date) || isNaN(date.getTime())) return null;
+    return date;
 }
 
 /** Format a Firestore timestamp or ISO string to readable Pacific Time date */
 function formatDate(dateValue: any): string {
-    if (!dateValue) return 'N/A';
-    const date = dateValue.toDate ? dateValue.toDate() : new Date(dateValue);
+    const date = toDateSafe(dateValue);
+    if (!date) return 'N/A';
     return date.toLocaleString('en-US', {
         timeZone: 'America/Los_Angeles',
         month: 'long',
@@ -97,8 +108,9 @@ export const sendCompletionNotification = functions
 
 
         // Construct the HTML email body
-        const formattedTimestamp = newValue.timestamp
-            ? newValue.timestamp.toDate().toLocaleString('en-US', {
+        const timestampDate = toDateSafe(newValue.timestamp);
+        const formattedTimestamp = timestampDate
+            ? timestampDate.toLocaleString('en-US', {
                 timeZone: 'America/Los_Angeles', // Convert to Pacific Time
                 month: 'long',
                 day: 'numeric',
@@ -186,12 +198,12 @@ export const sendCompletionNotification = functions
         } else if (typeof newValue.recurringServices === 'string' && newValue.recurringServices.trim().length > 0) {
             smsLines.push(`Recurring: ${newValue.recurringServices}`);
         }
-        if (newValue.oneTimeServices.length > 0) smsLines.push(`One-time: ${newValue.oneTimeServices}`);
-        if (newValue.landscapingServices.length > 0) smsLines.push(`Landscape: ${newValue.landscapingServices}`);
+        if (newValue.oneTimeServices && newValue.oneTimeServices.length > 0) smsLines.push(`One-time: ${newValue.oneTimeServices}`);
+        if (newValue.landscapingServices && newValue.landscapingServices.length > 0) smsLines.push(`Landscape: ${newValue.landscapingServices}`);
         smsLines.push('');
         if (newValue.optionalDetails) smsLines.push(`Optional: ${newValue.optionalDetails}`);
         if (newValue.additionalInfo) smsLines.push(`Additional: ${newValue.additionalInfo}`);
-        if (newValue.request_photo_urls) smsLines.push(`Additional images: ${newValue.request_photo_urls.length}`);
+        if (Array.isArray(newValue.request_photo_urls) && newValue.request_photo_urls.length > 0) smsLines.push(`Additional images: ${newValue.request_photo_urls.length}`);
         if (newValue.special_offer_photo_url != null) smsLines.push('Promo image: Yes!');
         smsLines.push(`https://www.suarezlawnservices.com/service-request/${requestId}`);
         if (customerEmail !== 'N/A') smsLines.push(`Email: ${customerEmail}`);
@@ -249,7 +261,7 @@ export const sendNewSubscriptionNotification = functions
         const planType = data.planType || 'N/A';
         const priceInCents = data.priceInCents || 0;
         const serviceDay = data.serviceDay || 'N/A';
-        const nextServiceDate = data.nextServiceDate || 'N/A';
+        const nextServiceDate = data.nextServiceDate ? formatDate(data.nextServiceDate) : 'N/A';
         const zoneName = data.zoneName || 'N/A';
         const department = data.department || 'N/A';
         const referredByCode = data.referredByCode || null;
@@ -449,8 +461,8 @@ export const onSubscriptionStatusChange = functions
     .firestore
     .document('subscriptions/{subId}')
     .onUpdate(async (change, context) => {
-        const beforeData = change.before.data();
-        const afterData = change.after.data();
+        const beforeData = change.before.data() || {};
+        const afterData = change.after.data() || {};
         const subId = context.params.subId;
 
         const beforeStatus = beforeData.status;
@@ -612,11 +624,16 @@ export const handleIncomingSms = functions
 
     // Twilio webhook validation middleware
     app.use((req, res, next) => {
-        // Reconstruct the full URL
-        const protocol = req.headers['x-forwarded-proto'] || 'https';
+        // Reconstruct the full URL. Firebase strips the function name from the
+        // request path, so prepend it to match the URL Twilio actually called.
+        const protoHeader = req.headers['x-forwarded-proto'];
+        const protocol = Array.isArray(protoHeader)
+            ? protoHeader[0]
+            : (protoHeader || 'https');
         const host = req.headers['host'];
-        const url = req.originalUrl || req.url;
-        const fullUrl = `${protocol}://${host}${url}handleIncomingSms`;
+        const rawUrl = req.originalUrl || req.url || '/';
+        const suffix = rawUrl === '/' ? '' : rawUrl;
+        const fullUrl = `${protocol}://${host}/handleIncomingSms${suffix}`;
         // Log the full URL
         console.log('Full URL used for validation:', fullUrl);
 
@@ -666,16 +683,29 @@ export const handleIncomingSms = functions
 
         try {
             const client = twilio(twilioSid.value(), twilioToken.value());
-            const sendSMSPromises = otherTeamMembers.map(async (phoneNumber) => {
-                console.log(`Sending message to ${phoneNumber}`);
-                await client.messages.create({
-                    body: messageToSend,
-                    from: twilioPhone.value(),
-                    to: phoneNumber
-                });
-            });
+            const results = await Promise.allSettled(
+                otherTeamMembers.map((phoneNumber) => {
+                    console.log(`Sending message to ${phoneNumber}`);
+                    return client.messages.create({
+                        body: messageToSend,
+                        from: twilioPhone.value(),
+                        to: phoneNumber
+                    });
+                })
+            );
 
-            await Promise.all(sendSMSPromises);
+            const failures = results
+                .map((r, i) => ({ r, phone: otherTeamMembers[i] }))
+                .filter(({ r }) => r.status === 'rejected');
+
+            for (const { r, phone } of failures) {
+                console.error(`Forward SMS failed for ${phone}:`, (r as PromiseRejectedResult).reason);
+            }
+
+            if (failures.length === otherTeamMembers.length && otherTeamMembers.length > 0) {
+                res.status(500).send('Error sending SMS');
+                return;
+            }
 
             console.log('Message forwarded to team members');
             res.status(200).send('Message forwarded');
@@ -758,13 +788,25 @@ async function sendEmail(subject: string, html: string): Promise<void> {
  */
 async function sendSMS(body: string): Promise<void> {
     const client = twilio(twilioSid.value(), twilioToken.value());
-    const sendSMSPromises = recipientPhoneNumbers.map(async (phoneNumber) => {
-        await client.messages.create({
-            body: body,
-            from: twilioPhone.value(),
-            to: phoneNumber
-        });
-    });
+    const results = await Promise.allSettled(
+        recipientPhoneNumbers.map((phoneNumber) =>
+            client.messages.create({
+                body: body,
+                from: twilioPhone.value(),
+                to: phoneNumber
+            })
+        )
+    );
 
-    await Promise.all(sendSMSPromises);
+    const failures = results
+        .map((r, i) => ({ r, phone: recipientPhoneNumbers[i] }))
+        .filter(({ r }) => r.status === 'rejected');
+
+    for (const { r, phone } of failures) {
+        console.error(`SMS send failed for ${phone}:`, (r as PromiseRejectedResult).reason);
+    }
+
+    if (failures.length === recipientPhoneNumbers.length && recipientPhoneNumbers.length > 0) {
+        throw new Error('All SMS sends failed');
+    }
 }
