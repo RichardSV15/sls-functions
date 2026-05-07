@@ -52,13 +52,20 @@ function formatPlanType(planType: string): string {
 
 /** Format cents to dollar string */
 function formatPrice(cents: number): string {
+    if (typeof cents !== 'number' || !Number.isFinite(cents)) return '$0.00';
     return `$${(cents / 100).toFixed(2)}`;
 }
 
 /** Format a Firestore timestamp or ISO string to readable Pacific Time date */
 function formatDate(dateValue: any): string {
     if (!dateValue) return 'N/A';
-    const date = dateValue.toDate ? dateValue.toDate() : new Date(dateValue);
+    let date: Date;
+    try {
+        date = dateValue.toDate ? dateValue.toDate() : new Date(dateValue);
+    } catch {
+        return 'N/A';
+    }
+    if (!(date instanceof Date) || isNaN(date.getTime())) return 'N/A';
     return date.toLocaleString('en-US', {
         timeZone: 'America/Los_Angeles',
         month: 'long',
@@ -71,6 +78,22 @@ function formatDate(dateValue: any): string {
 function capitalize(str: string): string {
     if (!str) return str;
     return str.charAt(0).toUpperCase() + str.slice(1);
+}
+
+/**
+ * Format a value (array, string, or anything) for display in notifications.
+ * Returns 'N/A' for empty/missing values; joins arrays with ", ".
+ */
+function formatList(value: any): string {
+    if (Array.isArray(value)) {
+        const filtered = value.filter((v) => v !== null && v !== undefined && String(v).trim() !== '');
+        return filtered.length > 0 ? filtered.join(', ') : 'N/A';
+    }
+    if (typeof value === 'string') {
+        return value.trim().length > 0 ? value : 'N/A';
+    }
+    if (value === null || value === undefined) return 'N/A';
+    return String(value);
 }
 
 
@@ -139,15 +162,15 @@ export const sendCompletionNotification = functions
             </tr>
             <tr>
             <td style="padding: 8px; border: 1px solid #ddd;"><strong>Recurring Info:</strong></td>
-            <td style="padding: 8px; border: 1px solid #ddd;">${newValue.recurringServices ? newValue.recurringServices : 'N/A'}</td>
+            <td style="padding: 8px; border: 1px solid #ddd;">${formatList(newValue.recurringServices)}</td>
             </tr>
             <tr>
             <td style="padding: 8px; border: 1px solid #ddd;"><strong>One Time Services Wanted:</strong></td>
-            <td style="padding: 8px; border: 1px solid #ddd;">${newValue.oneTimeServices ? newValue.oneTimeServices : 'N/A'}</td>
+            <td style="padding: 8px; border: 1px solid #ddd;">${formatList(newValue.oneTimeServices)}</td>
             </tr>
             <tr>
             <td style="padding: 8px; border: 1px solid #ddd;"><strong>Landscape Services Wanted:</strong></td>
-            <td style="padding: 8px; border: 1px solid #ddd;">${newValue.landscapingServices ? newValue.landscapingServices : 'N/A'}</td>
+            <td style="padding: 8px; border: 1px solid #ddd;">${formatList(newValue.landscapingServices)}</td>
             </tr>
             <tr>
             <td style="padding: 8px; border: 1px solid #ddd;"><strong>Optional Details:</strong></td>
@@ -186,12 +209,22 @@ export const sendCompletionNotification = functions
         } else if (typeof newValue.recurringServices === 'string' && newValue.recurringServices.trim().length > 0) {
             smsLines.push(`Recurring: ${newValue.recurringServices}`);
         }
-        if (newValue.oneTimeServices.length > 0) smsLines.push(`One-time: ${newValue.oneTimeServices}`);
-        if (newValue.landscapingServices.length > 0) smsLines.push(`Landscape: ${newValue.landscapingServices}`);
+        if (Array.isArray(newValue.oneTimeServices) && newValue.oneTimeServices.length > 0) {
+            smsLines.push(`One-time: ${newValue.oneTimeServices.join(', ')}`);
+        } else if (typeof newValue.oneTimeServices === 'string' && newValue.oneTimeServices.trim().length > 0) {
+            smsLines.push(`One-time: ${newValue.oneTimeServices}`);
+        }
+        if (Array.isArray(newValue.landscapingServices) && newValue.landscapingServices.length > 0) {
+            smsLines.push(`Landscape: ${newValue.landscapingServices.join(', ')}`);
+        } else if (typeof newValue.landscapingServices === 'string' && newValue.landscapingServices.trim().length > 0) {
+            smsLines.push(`Landscape: ${newValue.landscapingServices}`);
+        }
         smsLines.push('');
         if (newValue.optionalDetails) smsLines.push(`Optional: ${newValue.optionalDetails}`);
         if (newValue.additionalInfo) smsLines.push(`Additional: ${newValue.additionalInfo}`);
-        if (newValue.request_photo_urls) smsLines.push(`Additional images: ${newValue.request_photo_urls.length}`);
+        if (Array.isArray(newValue.request_photo_urls) && newValue.request_photo_urls.length > 0) {
+            smsLines.push(`Additional images: ${newValue.request_photo_urls.length}`);
+        }
         if (newValue.special_offer_photo_url != null) smsLines.push('Promo image: Yes!');
         smsLines.push(`https://www.suarezlawnservices.com/service-request/${requestId}`);
         if (customerEmail !== 'N/A') smsLines.push(`Email: ${customerEmail}`);
@@ -453,6 +486,11 @@ export const onSubscriptionStatusChange = functions
         const afterData = change.after.data();
         const subId = context.params.subId;
 
+        if (!beforeData || !afterData) {
+            console.error(`Missing snapshot data for subscription ${subId} update`);
+            return null;
+        }
+
         const beforeStatus = beforeData.status;
         const afterStatus = afterData.status;
 
@@ -666,18 +704,29 @@ export const handleIncomingSms = functions
 
         try {
             const client = twilio(twilioSid.value(), twilioToken.value());
-            const sendSMSPromises = otherTeamMembers.map(async (phoneNumber) => {
-                console.log(`Sending message to ${phoneNumber}`);
-                await client.messages.create({
-                    body: messageToSend,
-                    from: twilioPhone.value(),
-                    to: phoneNumber
-                });
+            const results = await Promise.allSettled(
+                otherTeamMembers.map(async (phoneNumber) => {
+                    console.log(`Sending message to ${phoneNumber}`);
+                    await client.messages.create({
+                        body: messageToSend,
+                        from: twilioPhone.value(),
+                        to: phoneNumber
+                    });
+                    return phoneNumber;
+                })
+            );
+
+            const failures = results.filter((r) => r.status === 'rejected');
+            failures.forEach((f) => {
+                console.error('Error forwarding SMS to team member:', (f as PromiseRejectedResult).reason);
             });
 
-            await Promise.all(sendSMSPromises);
+            if (failures.length === results.length && results.length > 0) {
+                res.status(500).send('Error sending SMS');
+                return;
+            }
 
-            console.log('Message forwarded to team members');
+            console.log(`Message forwarded to ${results.length - failures.length}/${results.length} team members`);
             res.status(200).send('Message forwarded');
         } catch (error) {
             console.error('Error sending SMS:', error);
