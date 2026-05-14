@@ -50,15 +50,28 @@ function formatPlanType(planType: string): string {
     return labels[planType] || planType;
 }
 
-/** Format cents to dollar string */
+/** Format cents to dollar string. Returns 'N/A' for non-finite values. */
 function formatPrice(cents: number): string {
+    if (typeof cents !== 'number' || !Number.isFinite(cents)) return 'N/A';
     return `$${(cents / 100).toFixed(2)}`;
 }
 
-/** Format a Firestore timestamp or ISO string to readable Pacific Time date */
+/** Format a Firestore timestamp, Date, or ISO string to readable Pacific Time date */
 function formatDate(dateValue: any): string {
-    if (!dateValue) return 'N/A';
-    const date = dateValue.toDate ? dateValue.toDate() : new Date(dateValue);
+    if (dateValue === null || dateValue === undefined || dateValue === '') return 'N/A';
+    let date: Date;
+    if (dateValue && typeof dateValue.toDate === 'function') {
+        try {
+            date = dateValue.toDate();
+        } catch {
+            return 'N/A';
+        }
+    } else if (dateValue instanceof Date) {
+        date = dateValue;
+    } else {
+        date = new Date(dateValue);
+    }
+    if (!(date instanceof Date) || isNaN(date.getTime())) return 'N/A';
     return date.toLocaleString('en-US', {
         timeZone: 'America/Los_Angeles',
         month: 'long',
@@ -67,10 +80,49 @@ function formatDate(dateValue: any): string {
     });
 }
 
+/** Format a timestamp with date and time in Pacific Time */
+function formatDateTime(dateValue: any): string {
+    if (dateValue === null || dateValue === undefined || dateValue === '') return 'N/A';
+    let date: Date;
+    if (dateValue && typeof dateValue.toDate === 'function') {
+        try {
+            date = dateValue.toDate();
+        } catch {
+            return 'N/A';
+        }
+    } else if (dateValue instanceof Date) {
+        date = dateValue;
+    } else {
+        date = new Date(dateValue);
+    }
+    if (!(date instanceof Date) || isNaN(date.getTime())) return 'N/A';
+    return date.toLocaleString('en-US', {
+        timeZone: 'America/Los_Angeles',
+        month: 'long',
+        day: 'numeric',
+        year: 'numeric',
+        hour: 'numeric',
+        minute: 'numeric',
+        hour12: true,
+    });
+}
+
 /** Capitalize first letter of a string */
 function capitalize(str: string): string {
-    if (!str) return str;
+    if (!str || typeof str !== 'string') return str;
     return str.charAt(0).toUpperCase() + str.slice(1);
+}
+
+/** Escape HTML special characters to prevent broken email rendering / injection. */
+function escapeHtml(value: any): string {
+    if (value === null || value === undefined) return '';
+    const str = String(value);
+    return str
+        .replace(/&/g, '&amp;')
+        .replace(/</g, '&lt;')
+        .replace(/>/g, '&gt;')
+        .replace(/"/g, '&quot;')
+        .replace(/'/g, '&#39;');
 }
 
 
@@ -95,19 +147,20 @@ export const sendCompletionNotification = functions
         const customerName = newValue.fullName || 'N/A';
         const customerEmail = newValue.customerEmail || 'N/A'; // Optional: if you have customer's email
 
+        const formattedTimestamp = formatDateTime(newValue.timestamp);
 
-        // Construct the HTML email body
-        const formattedTimestamp = newValue.timestamp
-            ? newValue.timestamp.toDate().toLocaleString('en-US', {
-                timeZone: 'America/Los_Angeles', // Convert to Pacific Time
-                month: 'long',
-                day: 'numeric',
-                year: 'numeric',
-                hour: 'numeric',
-                minute: 'numeric',
-                hour12: true
-            })
-            : 'N/A';
+        // Helpers to render fields safely for HTML / SMS without crashing on undefined.
+        const hasItems = (v: any): boolean => {
+            if (v === null || v === undefined) return false;
+            if (Array.isArray(v)) return v.length > 0;
+            if (typeof v === 'string') return v.trim().length > 0;
+            return true;
+        };
+        const renderField = (v: any): string => {
+            if (!hasItems(v)) return 'N/A';
+            if (Array.isArray(v)) return v.filter((x) => x !== null && x !== undefined && x !== '').join(', ');
+            return String(v);
+        };
 
         const messageBody = `
             <h2>New Service Request Created</h2>
@@ -115,53 +168,53 @@ export const sendCompletionNotification = functions
             <table style="width: 100%; border-collapse: collapse;">
             <tr>
             <td style="padding: 8px; border: 1px solid #ddd;"><strong>Request ID:</strong></td>
-            <td style="padding: 8px; border: 1px solid #ddd;">${requestId}</td>
+            <td style="padding: 8px; border: 1px solid #ddd;">${escapeHtml(requestId)}</td>
             </tr>
             <tr>
             <td style="padding: 8px; border: 1px solid #ddd;"><strong>Name:</strong></td>
-            <td style="padding: 8px; border: 1px solid #ddd;">${customerName}</td>
+            <td style="padding: 8px; border: 1px solid #ddd;">${escapeHtml(customerName)}</td>
             </tr>
             <tr>
             <td style="padding: 8px; border: 1px solid #ddd;"><strong>Phone Number:</strong></td>
-            <td style="padding: 8px; border: 1px solid #ddd;">${newValue.phoneNumber ? newValue.phoneNumber : 'N/A'}</td>
+            <td style="padding: 8px; border: 1px solid #ddd;">${escapeHtml(renderField(newValue.phoneNumber))}</td>
             </tr>
             <tr>
             <td style="padding: 8px; border: 1px solid #ddd;"><strong>Service Type:</strong></td>
-            <td style="padding: 8px; border: 1px solid #ddd;">${serviceType}</td>
+            <td style="padding: 8px; border: 1px solid #ddd;">${escapeHtml(serviceType)}</td>
             </tr>
             <tr>
             <td style="padding: 8px; border: 1px solid #ddd;"><strong>Time:</strong></td>
-            <td style="padding: 8px; border: 1px solid #ddd;">${formattedTimestamp}</td>
+            <td style="padding: 8px; border: 1px solid #ddd;">${escapeHtml(formattedTimestamp)}</td>
             </tr>
             <tr>
             <td style="padding: 8px; border: 1px solid #ddd;"><strong>Address:</strong></td>
-            <td style="padding: 8px; border: 1px solid #ddd;">${newValue.address ? newValue.address : 'N/A'}</td>
+            <td style="padding: 8px; border: 1px solid #ddd;">${escapeHtml(renderField(newValue.address))}</td>
             </tr>
             <tr>
             <td style="padding: 8px; border: 1px solid #ddd;"><strong>Recurring Info:</strong></td>
-            <td style="padding: 8px; border: 1px solid #ddd;">${newValue.recurringServices ? newValue.recurringServices : 'N/A'}</td>
+            <td style="padding: 8px; border: 1px solid #ddd;">${escapeHtml(renderField(newValue.recurringServices))}</td>
             </tr>
             <tr>
             <td style="padding: 8px; border: 1px solid #ddd;"><strong>One Time Services Wanted:</strong></td>
-            <td style="padding: 8px; border: 1px solid #ddd;">${newValue.oneTimeServices ? newValue.oneTimeServices : 'N/A'}</td>
+            <td style="padding: 8px; border: 1px solid #ddd;">${escapeHtml(renderField(newValue.oneTimeServices))}</td>
             </tr>
             <tr>
             <td style="padding: 8px; border: 1px solid #ddd;"><strong>Landscape Services Wanted:</strong></td>
-            <td style="padding: 8px; border: 1px solid #ddd;">${newValue.landscapingServices ? newValue.landscapingServices : 'N/A'}</td>
+            <td style="padding: 8px; border: 1px solid #ddd;">${escapeHtml(renderField(newValue.landscapingServices))}</td>
             </tr>
             <tr>
             <td style="padding: 8px; border: 1px solid #ddd;"><strong>Optional Details:</strong></td>
-            <td style="padding: 8px; border: 1px solid #ddd;">${newValue.optionalDetails ? newValue.optionalDetails : 'N/A'}</td>
+            <td style="padding: 8px; border: 1px solid #ddd;">${escapeHtml(renderField(newValue.optionalDetails))}</td>
             </tr>
             <tr>
             <td style="padding: 8px; border: 1px solid #ddd;"><strong>Additional Details:</strong></td>
-            <td style="padding: 8px; border: 1px solid #ddd;">${newValue.additionalInfo ? newValue.additionalInfo : 'N/A'}</td>
+            <td style="padding: 8px; border: 1px solid #ddd;">${escapeHtml(renderField(newValue.additionalInfo))}</td>
             </tr>
-            
+
             ${customerEmail !== 'N/A' ? `
             <tr>
             <td style="padding: 8px; border: 1px solid #ddd;"><strong>Customer Email:</strong></td>
-            <td style="padding: 8px; border: 1px solid #ddd;">${customerEmail}</td>
+            <td style="padding: 8px; border: 1px solid #ddd;">${escapeHtml(customerEmail)}</td>
             </tr>
             ` : ''}
             </table>
@@ -186,12 +239,14 @@ export const sendCompletionNotification = functions
         } else if (typeof newValue.recurringServices === 'string' && newValue.recurringServices.trim().length > 0) {
             smsLines.push(`Recurring: ${newValue.recurringServices}`);
         }
-        if (newValue.oneTimeServices.length > 0) smsLines.push(`One-time: ${newValue.oneTimeServices}`);
-        if (newValue.landscapingServices.length > 0) smsLines.push(`Landscape: ${newValue.landscapingServices}`);
+        if (hasItems(newValue.oneTimeServices)) smsLines.push(`One-time: ${renderField(newValue.oneTimeServices)}`);
+        if (hasItems(newValue.landscapingServices)) smsLines.push(`Landscape: ${renderField(newValue.landscapingServices)}`);
         smsLines.push('');
         if (newValue.optionalDetails) smsLines.push(`Optional: ${newValue.optionalDetails}`);
         if (newValue.additionalInfo) smsLines.push(`Additional: ${newValue.additionalInfo}`);
-        if (newValue.request_photo_urls) smsLines.push(`Additional images: ${newValue.request_photo_urls.length}`);
+        if (Array.isArray(newValue.request_photo_urls) && newValue.request_photo_urls.length > 0) {
+            smsLines.push(`Additional images: ${newValue.request_photo_urls.length}`);
+        }
         if (newValue.special_offer_photo_url != null) smsLines.push('Promo image: Yes!');
         smsLines.push(`https://www.suarezlawnservices.com/service-request/${requestId}`);
         if (customerEmail !== 'N/A') smsLines.push(`Email: ${customerEmail}`);
@@ -247,13 +302,13 @@ export const sendNewSubscriptionNotification = functions
         const customerEmail = data.customerEmail || 'N/A';
         const address = data.address || 'N/A';
         const planType = data.planType || 'N/A';
-        const priceInCents = data.priceInCents || 0;
+        const priceInCents = typeof data.priceInCents === 'number' ? data.priceInCents : 0;
         const serviceDay = data.serviceDay || 'N/A';
-        const nextServiceDate = data.nextServiceDate || 'N/A';
+        const nextServiceDate = formatDate(data.nextServiceDate);
         const zoneName = data.zoneName || 'N/A';
         const department = data.department || 'N/A';
         const referredByCode = data.referredByCode || null;
-        const adminLink = `https://www.suarezlawnservices.com/admin/subscriptions/${subId}`;
+        const adminLink = `https://www.suarezlawnservices.com/admin/subscriptions/${encodeURIComponent(subId)}`;
 
         // HTML email
         const emailHtml = `
@@ -262,52 +317,52 @@ export const sendNewSubscriptionNotification = functions
             <table style="width: 100%; border-collapse: collapse;">
             <tr>
                 <td style="padding: 8px; border: 1px solid #ddd;"><strong>Customer:</strong></td>
-                <td style="padding: 8px; border: 1px solid #ddd;">${customerName}</td>
+                <td style="padding: 8px; border: 1px solid #ddd;">${escapeHtml(customerName)}</td>
             </tr>
             <tr>
                 <td style="padding: 8px; border: 1px solid #ddd;"><strong>Phone:</strong></td>
-                <td style="padding: 8px; border: 1px solid #ddd;">${customerPhone}</td>
+                <td style="padding: 8px; border: 1px solid #ddd;">${escapeHtml(customerPhone)}</td>
             </tr>
             <tr>
                 <td style="padding: 8px; border: 1px solid #ddd;"><strong>Email:</strong></td>
-                <td style="padding: 8px; border: 1px solid #ddd;">${customerEmail}</td>
+                <td style="padding: 8px; border: 1px solid #ddd;">${escapeHtml(customerEmail)}</td>
             </tr>
             <tr>
                 <td style="padding: 8px; border: 1px solid #ddd;"><strong>Address:</strong></td>
-                <td style="padding: 8px; border: 1px solid #ddd;">${address}</td>
+                <td style="padding: 8px; border: 1px solid #ddd;">${escapeHtml(address)}</td>
             </tr>
             <tr>
                 <td style="padding: 8px; border: 1px solid #ddd;"><strong>Plan:</strong></td>
-                <td style="padding: 8px; border: 1px solid #ddd;">${formatPlanType(planType)}</td>
+                <td style="padding: 8px; border: 1px solid #ddd;">${escapeHtml(formatPlanType(planType))}</td>
             </tr>
             <tr>
                 <td style="padding: 8px; border: 1px solid #ddd;"><strong>Price:</strong></td>
-                <td style="padding: 8px; border: 1px solid #ddd;">${formatPrice(priceInCents)}</td>
+                <td style="padding: 8px; border: 1px solid #ddd;">${escapeHtml(formatPrice(priceInCents))}</td>
             </tr>
             <tr>
                 <td style="padding: 8px; border: 1px solid #ddd;"><strong>Service Day:</strong></td>
-                <td style="padding: 8px; border: 1px solid #ddd;">${capitalize(serviceDay)}</td>
+                <td style="padding: 8px; border: 1px solid #ddd;">${escapeHtml(capitalize(serviceDay))}</td>
             </tr>
             <tr>
                 <td style="padding: 8px; border: 1px solid #ddd;"><strong>First Service Date:</strong></td>
-                <td style="padding: 8px; border: 1px solid #ddd;">${nextServiceDate}</td>
+                <td style="padding: 8px; border: 1px solid #ddd;">${escapeHtml(nextServiceDate)}</td>
             </tr>
             <tr>
                 <td style="padding: 8px; border: 1px solid #ddd;"><strong>Zone:</strong></td>
-                <td style="padding: 8px; border: 1px solid #ddd;">${zoneName}</td>
+                <td style="padding: 8px; border: 1px solid #ddd;">${escapeHtml(zoneName)}</td>
             </tr>
             <tr>
                 <td style="padding: 8px; border: 1px solid #ddd;"><strong>Department:</strong></td>
-                <td style="padding: 8px; border: 1px solid #ddd;">${capitalize(department)}</td>
+                <td style="padding: 8px; border: 1px solid #ddd;">${escapeHtml(capitalize(department))}</td>
             </tr>
             ${referredByCode ? `
             <tr>
                 <td style="padding: 8px; border: 1px solid #ddd;"><strong>Referred By:</strong></td>
-                <td style="padding: 8px; border: 1px solid #ddd;">${referredByCode}</td>
+                <td style="padding: 8px; border: 1px solid #ddd;">${escapeHtml(referredByCode)}</td>
             </tr>
             ` : ''}
             </table>
-            <p><a href="${adminLink}">View in Admin Panel</a></p>
+            <p><a href="${escapeHtml(adminLink)}">View in Admin Panel</a></p>
         `;
 
         // SMS
@@ -372,13 +427,13 @@ export const sendPaymentReceivedNotification = functions
             return null;
         }
 
-        const subData = subDoc.data()!;
+        const subData = subDoc.data() || {};
         const customerName = subData.customerName || 'N/A';
-        const amountPaid = paymentData.amountPaid || 0;
+        const amountPaid = typeof paymentData.amountPaid === 'number' ? paymentData.amountPaid : 0;
         const invoiceId = paymentData.stripeInvoiceId || 'N/A';
         const planType = subData.planType || 'N/A';
         const subscriptionStatus = subData.status || 'N/A';
-        const adminLink = `https://www.suarezlawnservices.com/admin/subscriptions/${subId}`;
+        const adminLink = `https://www.suarezlawnservices.com/admin/subscriptions/${encodeURIComponent(subId)}`;
 
         // HTML email
         const emailHtml = `
@@ -387,26 +442,26 @@ export const sendPaymentReceivedNotification = functions
             <table style="width: 100%; border-collapse: collapse;">
             <tr>
                 <td style="padding: 8px; border: 1px solid #ddd;"><strong>Customer:</strong></td>
-                <td style="padding: 8px; border: 1px solid #ddd;">${customerName}</td>
+                <td style="padding: 8px; border: 1px solid #ddd;">${escapeHtml(customerName)}</td>
             </tr>
             <tr>
                 <td style="padding: 8px; border: 1px solid #ddd;"><strong>Amount:</strong></td>
-                <td style="padding: 8px; border: 1px solid #ddd;">${formatPrice(amountPaid)}</td>
+                <td style="padding: 8px; border: 1px solid #ddd;">${escapeHtml(formatPrice(amountPaid))}</td>
             </tr>
             <tr>
                 <td style="padding: 8px; border: 1px solid #ddd;"><strong>Plan:</strong></td>
-                <td style="padding: 8px; border: 1px solid #ddd;">${formatPlanType(planType)}</td>
+                <td style="padding: 8px; border: 1px solid #ddd;">${escapeHtml(formatPlanType(planType))}</td>
             </tr>
             <tr>
                 <td style="padding: 8px; border: 1px solid #ddd;"><strong>Invoice ID:</strong></td>
-                <td style="padding: 8px; border: 1px solid #ddd;">${invoiceId}</td>
+                <td style="padding: 8px; border: 1px solid #ddd;">${escapeHtml(invoiceId)}</td>
             </tr>
             <tr>
                 <td style="padding: 8px; border: 1px solid #ddd;"><strong>Status:</strong></td>
-                <td style="padding: 8px; border: 1px solid #ddd;">${subscriptionStatus}</td>
+                <td style="padding: 8px; border: 1px solid #ddd;">${escapeHtml(subscriptionStatus)}</td>
             </tr>
             </table>
-            <p><a href="${adminLink}">View in Admin Panel</a></p>
+            <p><a href="${escapeHtml(adminLink)}">View in Admin Panel</a></p>
         `;
 
         // SMS
@@ -453,7 +508,12 @@ export const onSubscriptionStatusChange = functions
         const afterData = change.after.data();
         const subId = context.params.subId;
 
-        const beforeStatus = beforeData.status;
+        if (!afterData) {
+            console.warn(`Subscription ${subId} update has no after-data; skipping.`);
+            return null;
+        }
+
+        const beforeStatus = beforeData ? beforeData.status : undefined;
         const afterStatus = afterData.status;
 
         // Only proceed if status actually changed
@@ -480,8 +540,8 @@ async function notifyPaymentFailed(
     const customerPhone = data.customerPhone || 'N/A';
     const address = data.address || 'N/A';
     const planType = data.planType || 'N/A';
-    const priceInCents = data.priceInCents || 0;
-    const adminLink = `https://www.suarezlawnservices.com/admin/subscriptions/${subId}`;
+    const priceInCents = typeof data.priceInCents === 'number' ? data.priceInCents : 0;
+    const adminLink = `https://www.suarezlawnservices.com/admin/subscriptions/${encodeURIComponent(subId)}`;
 
     const emailHtml = `
         <h2 style="color: #d32f2f;">Payment Failed</h2>
@@ -489,26 +549,26 @@ async function notifyPaymentFailed(
         <table style="width: 100%; border-collapse: collapse;">
         <tr>
             <td style="padding: 8px; border: 1px solid #ddd;"><strong>Customer:</strong></td>
-            <td style="padding: 8px; border: 1px solid #ddd;">${customerName}</td>
+            <td style="padding: 8px; border: 1px solid #ddd;">${escapeHtml(customerName)}</td>
         </tr>
         <tr>
             <td style="padding: 8px; border: 1px solid #ddd;"><strong>Phone:</strong></td>
-            <td style="padding: 8px; border: 1px solid #ddd;">${customerPhone}</td>
+            <td style="padding: 8px; border: 1px solid #ddd;">${escapeHtml(customerPhone)}</td>
         </tr>
         <tr>
             <td style="padding: 8px; border: 1px solid #ddd;"><strong>Address:</strong></td>
-            <td style="padding: 8px; border: 1px solid #ddd;">${address}</td>
+            <td style="padding: 8px; border: 1px solid #ddd;">${escapeHtml(address)}</td>
         </tr>
         <tr>
             <td style="padding: 8px; border: 1px solid #ddd;"><strong>Plan:</strong></td>
-            <td style="padding: 8px; border: 1px solid #ddd;">${formatPlanType(planType)}</td>
+            <td style="padding: 8px; border: 1px solid #ddd;">${escapeHtml(formatPlanType(planType))}</td>
         </tr>
         <tr>
             <td style="padding: 8px; border: 1px solid #ddd;"><strong>Price:</strong></td>
-            <td style="padding: 8px; border: 1px solid #ddd;">${formatPrice(priceInCents)}</td>
+            <td style="padding: 8px; border: 1px solid #ddd;">${escapeHtml(formatPrice(priceInCents))}</td>
         </tr>
         </table>
-        <p><a href="${adminLink}">View in Admin Panel</a></p>
+        <p><a href="${escapeHtml(adminLink)}">View in Admin Panel</a></p>
     `;
 
     const smsBody = [
@@ -545,9 +605,9 @@ async function notifyCancellation(
 ): Promise<void> {
     const customerName = data.customerName || 'N/A';
     const planType = data.planType || 'N/A';
-    const priceInCents = data.priceInCents || 0;
-    const canceledAt = data.canceledAt ? formatDate(data.canceledAt) : 'N/A';
-    const adminLink = `https://www.suarezlawnservices.com/admin/subscriptions/${subId}`;
+    const priceInCents = typeof data.priceInCents === 'number' ? data.priceInCents : 0;
+    const canceledAt = formatDate(data.canceledAt);
+    const adminLink = `https://www.suarezlawnservices.com/admin/subscriptions/${encodeURIComponent(subId)}`;
 
     const emailHtml = `
         <h2>Subscription Canceled</h2>
@@ -555,22 +615,22 @@ async function notifyCancellation(
         <table style="width: 100%; border-collapse: collapse;">
         <tr>
             <td style="padding: 8px; border: 1px solid #ddd;"><strong>Customer:</strong></td>
-            <td style="padding: 8px; border: 1px solid #ddd;">${customerName}</td>
+            <td style="padding: 8px; border: 1px solid #ddd;">${escapeHtml(customerName)}</td>
         </tr>
         <tr>
             <td style="padding: 8px; border: 1px solid #ddd;"><strong>Plan:</strong></td>
-            <td style="padding: 8px; border: 1px solid #ddd;">${formatPlanType(planType)}</td>
+            <td style="padding: 8px; border: 1px solid #ddd;">${escapeHtml(formatPlanType(planType))}</td>
         </tr>
         <tr>
             <td style="padding: 8px; border: 1px solid #ddd;"><strong>Price:</strong></td>
-            <td style="padding: 8px; border: 1px solid #ddd;">${formatPrice(priceInCents)}</td>
+            <td style="padding: 8px; border: 1px solid #ddd;">${escapeHtml(formatPrice(priceInCents))}</td>
         </tr>
         <tr>
             <td style="padding: 8px; border: 1px solid #ddd;"><strong>Canceled At:</strong></td>
-            <td style="padding: 8px; border: 1px solid #ddd;">${canceledAt}</td>
+            <td style="padding: 8px; border: 1px solid #ddd;">${escapeHtml(canceledAt)}</td>
         </tr>
         </table>
-        <p><a href="${adminLink}">View in Admin Panel</a></p>
+        <p><a href="${escapeHtml(adminLink)}">View in Admin Panel</a></p>
     `;
 
     const smsBody = [
@@ -612,16 +672,21 @@ export const handleIncomingSms = functions
 
     // Twilio webhook validation middleware
     app.use((req, res, next) => {
-        // Reconstruct the full URL
-        const protocol = req.headers['x-forwarded-proto'] || 'https';
+        // Reconstruct the full URL. Twilio signs the exact URL it POSTs to,
+        // so do NOT append anything to the request path.
+        const protocol = (req.headers['x-forwarded-proto'] as string) || req.protocol || 'https';
         const host = req.headers['host'];
         const url = req.originalUrl || req.url;
-        const fullUrl = `${protocol}://${host}${url}handleIncomingSms`;
-        // Log the full URL
+        const fullUrl = `${protocol}://${host}${url}`;
         console.log('Full URL used for validation:', fullUrl);
 
-        // Validate the Twilio request
-        const twilioSignature = req.headers['x-twilio-signature'] as string;
+        const twilioSignature = req.headers['x-twilio-signature'] as string | undefined;
+        if (!twilioSignature) {
+            console.error('Missing x-twilio-signature header');
+            res.status(403).send('Missing Twilio signature');
+            return;
+        }
+
         const isValid = twilio.validateRequest(
             twilioToken.value(),
             twilioSignature,
@@ -666,18 +731,33 @@ export const handleIncomingSms = functions
 
         try {
             const client = twilio(twilioSid.value(), twilioToken.value());
-            const sendSMSPromises = otherTeamMembers.map(async (phoneNumber) => {
-                console.log(`Sending message to ${phoneNumber}`);
-                await client.messages.create({
-                    body: messageToSend,
-                    from: twilioPhone.value(),
-                    to: phoneNumber
-                });
+            const results = await Promise.allSettled(
+                otherTeamMembers.map(async (phoneNumber) => {
+                    console.log(`Sending message to ${phoneNumber}`);
+                    await client.messages.create({
+                        body: messageToSend,
+                        from: twilioPhone.value(),
+                        to: phoneNumber,
+                    });
+                })
+            );
+
+            const failures = results.filter((r) => r.status === 'rejected');
+            failures.forEach((failure, idx) => {
+                console.error(
+                    `Failed to forward SMS to ${otherTeamMembers[idx]}:`,
+                    (failure as PromiseRejectedResult).reason
+                );
             });
 
-            await Promise.all(sendSMSPromises);
+            if (failures.length === otherTeamMembers.length && otherTeamMembers.length > 0) {
+                res.status(500).send('Error sending SMS');
+                return;
+            }
 
-            console.log('Message forwarded to team members');
+            console.log(
+                `Message forwarded to ${otherTeamMembers.length - failures.length}/${otherTeamMembers.length} team members`
+            );
             res.status(200).send('Message forwarded');
         } catch (error) {
             console.error('Error sending SMS:', error);
@@ -758,13 +838,26 @@ async function sendEmail(subject: string, html: string): Promise<void> {
  */
 async function sendSMS(body: string): Promise<void> {
     const client = twilio(twilioSid.value(), twilioToken.value());
-    const sendSMSPromises = recipientPhoneNumbers.map(async (phoneNumber) => {
-        await client.messages.create({
-            body: body,
-            from: twilioPhone.value(),
-            to: phoneNumber
-        });
+    const results = await Promise.allSettled(
+        recipientPhoneNumbers.map((phoneNumber) =>
+            client.messages.create({
+                body: body,
+                from: twilioPhone.value(),
+                to: phoneNumber,
+            })
+        )
+    );
+
+    const failures: string[] = [];
+    results.forEach((result, idx) => {
+        if (result.status === 'rejected') {
+            const phone = recipientPhoneNumbers[idx];
+            failures.push(phone);
+            console.error(`Failed to send SMS to ${phone}:`, result.reason);
+        }
     });
 
-    await Promise.all(sendSMSPromises);
+    if (failures.length === recipientPhoneNumbers.length && recipientPhoneNumbers.length > 0) {
+        throw new Error(`Failed to send SMS to all recipients: ${failures.join(', ')}`);
+    }
 }
