@@ -58,12 +58,39 @@ function formatPrice(cents: number): string {
 /** Format a Firestore timestamp or ISO string to readable Pacific Time date */
 function formatDate(dateValue: any): string {
     if (!dateValue) return 'N/A';
-    const date = dateValue.toDate ? dateValue.toDate() : new Date(dateValue);
+    let date: Date;
+    try {
+        date = typeof dateValue.toDate === 'function' ? dateValue.toDate() : new Date(dateValue);
+    } catch {
+        return 'N/A';
+    }
+    if (!(date instanceof Date) || isNaN(date.getTime())) return 'N/A';
     return date.toLocaleString('en-US', {
         timeZone: 'America/Los_Angeles',
         month: 'long',
         day: 'numeric',
         year: 'numeric',
+    });
+}
+
+/** Format a Firestore timestamp or ISO string to readable Pacific Time date + time */
+function formatDateTime(dateValue: any): string {
+    if (!dateValue) return 'N/A';
+    let date: Date;
+    try {
+        date = typeof dateValue.toDate === 'function' ? dateValue.toDate() : new Date(dateValue);
+    } catch {
+        return 'N/A';
+    }
+    if (!(date instanceof Date) || isNaN(date.getTime())) return 'N/A';
+    return date.toLocaleString('en-US', {
+        timeZone: 'America/Los_Angeles',
+        month: 'long',
+        day: 'numeric',
+        year: 'numeric',
+        hour: 'numeric',
+        minute: 'numeric',
+        hour12: true,
     });
 }
 
@@ -97,17 +124,7 @@ export const sendCompletionNotification = functions
 
 
         // Construct the HTML email body
-        const formattedTimestamp = newValue.timestamp
-            ? newValue.timestamp.toDate().toLocaleString('en-US', {
-                timeZone: 'America/Los_Angeles', // Convert to Pacific Time
-                month: 'long',
-                day: 'numeric',
-                year: 'numeric',
-                hour: 'numeric',
-                minute: 'numeric',
-                hour12: true
-            })
-            : 'N/A';
+        const formattedTimestamp = formatDateTime(newValue.timestamp);
 
         const messageBody = `
             <h2>New Service Request Created</h2>
@@ -186,12 +203,18 @@ export const sendCompletionNotification = functions
         } else if (typeof newValue.recurringServices === 'string' && newValue.recurringServices.trim().length > 0) {
             smsLines.push(`Recurring: ${newValue.recurringServices}`);
         }
-        if (newValue.oneTimeServices.length > 0) smsLines.push(`One-time: ${newValue.oneTimeServices}`);
-        if (newValue.landscapingServices.length > 0) smsLines.push(`Landscape: ${newValue.landscapingServices}`);
+        if (Array.isArray(newValue.oneTimeServices) ? newValue.oneTimeServices.length > 0 : !!newValue.oneTimeServices) {
+            smsLines.push(`One-time: ${newValue.oneTimeServices}`);
+        }
+        if (Array.isArray(newValue.landscapingServices) ? newValue.landscapingServices.length > 0 : !!newValue.landscapingServices) {
+            smsLines.push(`Landscape: ${newValue.landscapingServices}`);
+        }
         smsLines.push('');
         if (newValue.optionalDetails) smsLines.push(`Optional: ${newValue.optionalDetails}`);
         if (newValue.additionalInfo) smsLines.push(`Additional: ${newValue.additionalInfo}`);
-        if (newValue.request_photo_urls) smsLines.push(`Additional images: ${newValue.request_photo_urls.length}`);
+        if (Array.isArray(newValue.request_photo_urls) && newValue.request_photo_urls.length > 0) {
+            smsLines.push(`Additional images: ${newValue.request_photo_urls.length}`);
+        }
         if (newValue.special_offer_photo_url != null) smsLines.push('Promo image: Yes!');
         smsLines.push(`https://www.suarezlawnservices.com/service-request/${requestId}`);
         if (customerEmail !== 'N/A') smsLines.push(`Email: ${customerEmail}`);
@@ -249,7 +272,9 @@ export const sendNewSubscriptionNotification = functions
         const planType = data.planType || 'N/A';
         const priceInCents = data.priceInCents || 0;
         const serviceDay = data.serviceDay || 'N/A';
-        const nextServiceDate = data.nextServiceDate || 'N/A';
+        const nextServiceDate = data.nextServiceDate
+            ? formatDate(data.nextServiceDate)
+            : 'N/A';
         const zoneName = data.zoneName || 'N/A';
         const department = data.department || 'N/A';
         const referredByCode = data.referredByCode || null;
@@ -615,8 +640,9 @@ export const handleIncomingSms = functions
         // Reconstruct the full URL
         const protocol = req.headers['x-forwarded-proto'] || 'https';
         const host = req.headers['host'];
-        const url = req.originalUrl || req.url;
-        const fullUrl = `${protocol}://${host}${url}handleIncomingSms`;
+        const rawUrl = req.originalUrl || req.url || '/';
+        const separator = rawUrl.endsWith('/') ? '' : '/';
+        const fullUrl = `${protocol}://${host}${rawUrl}${separator}handleIncomingSms`;
         // Log the full URL
         console.log('Full URL used for validation:', fullUrl);
 
@@ -639,8 +665,9 @@ export const handleIncomingSms = functions
 
     // Handle the incoming SMS
     app.post('*', async (req, res) => {
-        const fromNumber = req.body.From as string;
-        const messageBody = req.body.Body as string;
+        const body = req.body || {};
+        const fromNumber = body.From as string | undefined;
+        const messageBody = body.Body as string | undefined;
 
         console.log('Received message from:', fromNumber);
         console.log('Message body:', messageBody);
