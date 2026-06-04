@@ -57,8 +57,14 @@ function formatPrice(cents: number): string {
 
 /** Format a Firestore timestamp or ISO string to readable Pacific Time date */
 function formatDate(dateValue: any): string {
-    if (!dateValue) return 'N/A';
-    const date = dateValue.toDate ? dateValue.toDate() : new Date(dateValue);
+    if (dateValue === null || dateValue === undefined || dateValue === '') return 'N/A';
+    let date: Date;
+    try {
+        date = typeof dateValue?.toDate === 'function' ? dateValue.toDate() : new Date(dateValue);
+    } catch {
+        return 'N/A';
+    }
+    if (!(date instanceof Date) || isNaN(date.getTime())) return 'N/A';
     return date.toLocaleString('en-US', {
         timeZone: 'America/Los_Angeles',
         month: 'long',
@@ -67,10 +73,62 @@ function formatDate(dateValue: any): string {
     });
 }
 
+/** Format a Firestore timestamp or ISO string to readable Pacific Time date + time */
+function formatDateTime(dateValue: any): string {
+    if (dateValue === null || dateValue === undefined || dateValue === '') return 'N/A';
+    let date: Date;
+    try {
+        date = typeof dateValue?.toDate === 'function' ? dateValue.toDate() : new Date(dateValue);
+    } catch {
+        return 'N/A';
+    }
+    if (!(date instanceof Date) || isNaN(date.getTime())) return 'N/A';
+    return date.toLocaleString('en-US', {
+        timeZone: 'America/Los_Angeles',
+        month: 'long',
+        day: 'numeric',
+        year: 'numeric',
+        hour: 'numeric',
+        minute: 'numeric',
+        hour12: true,
+    });
+}
+
 /** Capitalize first letter of a string */
 function capitalize(str: string): string {
-    if (!str) return str;
+    if (!str || typeof str !== 'string') return str || '';
     return str.charAt(0).toUpperCase() + str.slice(1);
+}
+
+/** Escape HTML special characters to avoid breaking email rendering. */
+function escapeHtml(value: unknown): string {
+    if (value === null || value === undefined) return '';
+    return String(value)
+        .replace(/&/g, '&amp;')
+        .replace(/</g, '&lt;')
+        .replace(/>/g, '&gt;')
+        .replace(/"/g, '&quot;')
+        .replace(/'/g, '&#39;');
+}
+
+/** Render a possibly-array, possibly-string field as a readable string, or 'N/A' if empty. */
+function renderListField(value: unknown): string {
+    if (value === null || value === undefined) return 'N/A';
+    if (Array.isArray(value)) {
+        const filtered = value.filter(v => v !== null && v !== undefined && String(v).trim() !== '');
+        return filtered.length > 0 ? filtered.join(', ') : 'N/A';
+    }
+    if (typeof value === 'string') {
+        return value.trim().length > 0 ? value : 'N/A';
+    }
+    return String(value);
+}
+
+/** Returns true if the value is a non-empty array or non-empty string. */
+function hasListContent(value: unknown): boolean {
+    if (Array.isArray(value)) return value.some(v => v !== null && v !== undefined && String(v).trim() !== '');
+    if (typeof value === 'string') return value.trim().length > 0;
+    return false;
 }
 
 
@@ -97,17 +155,7 @@ export const sendCompletionNotification = functions
 
 
         // Construct the HTML email body
-        const formattedTimestamp = newValue.timestamp
-            ? newValue.timestamp.toDate().toLocaleString('en-US', {
-                timeZone: 'America/Los_Angeles', // Convert to Pacific Time
-                month: 'long',
-                day: 'numeric',
-                year: 'numeric',
-                hour: 'numeric',
-                minute: 'numeric',
-                hour12: true
-            })
-            : 'N/A';
+        const formattedTimestamp = formatDateTime(newValue.timestamp);
 
         const messageBody = `
             <h2>New Service Request Created</h2>
@@ -115,53 +163,53 @@ export const sendCompletionNotification = functions
             <table style="width: 100%; border-collapse: collapse;">
             <tr>
             <td style="padding: 8px; border: 1px solid #ddd;"><strong>Request ID:</strong></td>
-            <td style="padding: 8px; border: 1px solid #ddd;">${requestId}</td>
+            <td style="padding: 8px; border: 1px solid #ddd;">${escapeHtml(requestId)}</td>
             </tr>
             <tr>
             <td style="padding: 8px; border: 1px solid #ddd;"><strong>Name:</strong></td>
-            <td style="padding: 8px; border: 1px solid #ddd;">${customerName}</td>
+            <td style="padding: 8px; border: 1px solid #ddd;">${escapeHtml(customerName)}</td>
             </tr>
             <tr>
             <td style="padding: 8px; border: 1px solid #ddd;"><strong>Phone Number:</strong></td>
-            <td style="padding: 8px; border: 1px solid #ddd;">${newValue.phoneNumber ? newValue.phoneNumber : 'N/A'}</td>
+            <td style="padding: 8px; border: 1px solid #ddd;">${escapeHtml(newValue.phoneNumber || 'N/A')}</td>
             </tr>
             <tr>
             <td style="padding: 8px; border: 1px solid #ddd;"><strong>Service Type:</strong></td>
-            <td style="padding: 8px; border: 1px solid #ddd;">${serviceType}</td>
+            <td style="padding: 8px; border: 1px solid #ddd;">${escapeHtml(serviceType)}</td>
             </tr>
             <tr>
             <td style="padding: 8px; border: 1px solid #ddd;"><strong>Time:</strong></td>
-            <td style="padding: 8px; border: 1px solid #ddd;">${formattedTimestamp}</td>
+            <td style="padding: 8px; border: 1px solid #ddd;">${escapeHtml(formattedTimestamp)}</td>
             </tr>
             <tr>
             <td style="padding: 8px; border: 1px solid #ddd;"><strong>Address:</strong></td>
-            <td style="padding: 8px; border: 1px solid #ddd;">${newValue.address ? newValue.address : 'N/A'}</td>
+            <td style="padding: 8px; border: 1px solid #ddd;">${escapeHtml(newValue.address || 'N/A')}</td>
             </tr>
             <tr>
             <td style="padding: 8px; border: 1px solid #ddd;"><strong>Recurring Info:</strong></td>
-            <td style="padding: 8px; border: 1px solid #ddd;">${newValue.recurringServices ? newValue.recurringServices : 'N/A'}</td>
+            <td style="padding: 8px; border: 1px solid #ddd;">${escapeHtml(renderListField(newValue.recurringServices))}</td>
             </tr>
             <tr>
             <td style="padding: 8px; border: 1px solid #ddd;"><strong>One Time Services Wanted:</strong></td>
-            <td style="padding: 8px; border: 1px solid #ddd;">${newValue.oneTimeServices ? newValue.oneTimeServices : 'N/A'}</td>
+            <td style="padding: 8px; border: 1px solid #ddd;">${escapeHtml(renderListField(newValue.oneTimeServices))}</td>
             </tr>
             <tr>
             <td style="padding: 8px; border: 1px solid #ddd;"><strong>Landscape Services Wanted:</strong></td>
-            <td style="padding: 8px; border: 1px solid #ddd;">${newValue.landscapingServices ? newValue.landscapingServices : 'N/A'}</td>
+            <td style="padding: 8px; border: 1px solid #ddd;">${escapeHtml(renderListField(newValue.landscapingServices))}</td>
             </tr>
             <tr>
             <td style="padding: 8px; border: 1px solid #ddd;"><strong>Optional Details:</strong></td>
-            <td style="padding: 8px; border: 1px solid #ddd;">${newValue.optionalDetails ? newValue.optionalDetails : 'N/A'}</td>
+            <td style="padding: 8px; border: 1px solid #ddd;">${escapeHtml(newValue.optionalDetails || 'N/A')}</td>
             </tr>
             <tr>
             <td style="padding: 8px; border: 1px solid #ddd;"><strong>Additional Details:</strong></td>
-            <td style="padding: 8px; border: 1px solid #ddd;">${newValue.additionalInfo ? newValue.additionalInfo : 'N/A'}</td>
+            <td style="padding: 8px; border: 1px solid #ddd;">${escapeHtml(newValue.additionalInfo || 'N/A')}</td>
             </tr>
-            
+
             ${customerEmail !== 'N/A' ? `
             <tr>
             <td style="padding: 8px; border: 1px solid #ddd;"><strong>Customer Email:</strong></td>
-            <td style="padding: 8px; border: 1px solid #ddd;">${customerEmail}</td>
+            <td style="padding: 8px; border: 1px solid #ddd;">${escapeHtml(customerEmail)}</td>
             </tr>
             ` : ''}
             </table>
@@ -186,12 +234,14 @@ export const sendCompletionNotification = functions
         } else if (typeof newValue.recurringServices === 'string' && newValue.recurringServices.trim().length > 0) {
             smsLines.push(`Recurring: ${newValue.recurringServices}`);
         }
-        if (newValue.oneTimeServices.length > 0) smsLines.push(`One-time: ${newValue.oneTimeServices}`);
-        if (newValue.landscapingServices.length > 0) smsLines.push(`Landscape: ${newValue.landscapingServices}`);
+        if (hasListContent(newValue.oneTimeServices)) smsLines.push(`One-time: ${renderListField(newValue.oneTimeServices)}`);
+        if (hasListContent(newValue.landscapingServices)) smsLines.push(`Landscape: ${renderListField(newValue.landscapingServices)}`);
         smsLines.push('');
         if (newValue.optionalDetails) smsLines.push(`Optional: ${newValue.optionalDetails}`);
         if (newValue.additionalInfo) smsLines.push(`Additional: ${newValue.additionalInfo}`);
-        if (newValue.request_photo_urls) smsLines.push(`Additional images: ${newValue.request_photo_urls.length}`);
+        if (Array.isArray(newValue.request_photo_urls) && newValue.request_photo_urls.length > 0) {
+            smsLines.push(`Additional images: ${newValue.request_photo_urls.length}`);
+        }
         if (newValue.special_offer_photo_url != null) smsLines.push('Promo image: Yes!');
         smsLines.push(`https://www.suarezlawnservices.com/service-request/${requestId}`);
         if (customerEmail !== 'N/A') smsLines.push(`Email: ${customerEmail}`);
@@ -247,9 +297,9 @@ export const sendNewSubscriptionNotification = functions
         const customerEmail = data.customerEmail || 'N/A';
         const address = data.address || 'N/A';
         const planType = data.planType || 'N/A';
-        const priceInCents = data.priceInCents || 0;
+        const priceInCents = typeof data.priceInCents === 'number' ? data.priceInCents : 0;
         const serviceDay = data.serviceDay || 'N/A';
-        const nextServiceDate = data.nextServiceDate || 'N/A';
+        const nextServiceDate = data.nextServiceDate ? formatDate(data.nextServiceDate) : 'N/A';
         const zoneName = data.zoneName || 'N/A';
         const department = data.department || 'N/A';
         const referredByCode = data.referredByCode || null;
@@ -262,23 +312,23 @@ export const sendNewSubscriptionNotification = functions
             <table style="width: 100%; border-collapse: collapse;">
             <tr>
                 <td style="padding: 8px; border: 1px solid #ddd;"><strong>Customer:</strong></td>
-                <td style="padding: 8px; border: 1px solid #ddd;">${customerName}</td>
+                <td style="padding: 8px; border: 1px solid #ddd;">${escapeHtml(customerName)}</td>
             </tr>
             <tr>
                 <td style="padding: 8px; border: 1px solid #ddd;"><strong>Phone:</strong></td>
-                <td style="padding: 8px; border: 1px solid #ddd;">${customerPhone}</td>
+                <td style="padding: 8px; border: 1px solid #ddd;">${escapeHtml(customerPhone)}</td>
             </tr>
             <tr>
                 <td style="padding: 8px; border: 1px solid #ddd;"><strong>Email:</strong></td>
-                <td style="padding: 8px; border: 1px solid #ddd;">${customerEmail}</td>
+                <td style="padding: 8px; border: 1px solid #ddd;">${escapeHtml(customerEmail)}</td>
             </tr>
             <tr>
                 <td style="padding: 8px; border: 1px solid #ddd;"><strong>Address:</strong></td>
-                <td style="padding: 8px; border: 1px solid #ddd;">${address}</td>
+                <td style="padding: 8px; border: 1px solid #ddd;">${escapeHtml(address)}</td>
             </tr>
             <tr>
                 <td style="padding: 8px; border: 1px solid #ddd;"><strong>Plan:</strong></td>
-                <td style="padding: 8px; border: 1px solid #ddd;">${formatPlanType(planType)}</td>
+                <td style="padding: 8px; border: 1px solid #ddd;">${escapeHtml(formatPlanType(planType))}</td>
             </tr>
             <tr>
                 <td style="padding: 8px; border: 1px solid #ddd;"><strong>Price:</strong></td>
@@ -286,24 +336,24 @@ export const sendNewSubscriptionNotification = functions
             </tr>
             <tr>
                 <td style="padding: 8px; border: 1px solid #ddd;"><strong>Service Day:</strong></td>
-                <td style="padding: 8px; border: 1px solid #ddd;">${capitalize(serviceDay)}</td>
+                <td style="padding: 8px; border: 1px solid #ddd;">${escapeHtml(capitalize(serviceDay))}</td>
             </tr>
             <tr>
                 <td style="padding: 8px; border: 1px solid #ddd;"><strong>First Service Date:</strong></td>
-                <td style="padding: 8px; border: 1px solid #ddd;">${nextServiceDate}</td>
+                <td style="padding: 8px; border: 1px solid #ddd;">${escapeHtml(nextServiceDate)}</td>
             </tr>
             <tr>
                 <td style="padding: 8px; border: 1px solid #ddd;"><strong>Zone:</strong></td>
-                <td style="padding: 8px; border: 1px solid #ddd;">${zoneName}</td>
+                <td style="padding: 8px; border: 1px solid #ddd;">${escapeHtml(zoneName)}</td>
             </tr>
             <tr>
                 <td style="padding: 8px; border: 1px solid #ddd;"><strong>Department:</strong></td>
-                <td style="padding: 8px; border: 1px solid #ddd;">${capitalize(department)}</td>
+                <td style="padding: 8px; border: 1px solid #ddd;">${escapeHtml(capitalize(department))}</td>
             </tr>
             ${referredByCode ? `
             <tr>
                 <td style="padding: 8px; border: 1px solid #ddd;"><strong>Referred By:</strong></td>
-                <td style="padding: 8px; border: 1px solid #ddd;">${referredByCode}</td>
+                <td style="padding: 8px; border: 1px solid #ddd;">${escapeHtml(referredByCode)}</td>
             </tr>
             ` : ''}
             </table>
@@ -372,9 +422,13 @@ export const sendPaymentReceivedNotification = functions
             return null;
         }
 
-        const subData = subDoc.data()!;
+        const subData = subDoc.data();
+        if (!subData) {
+            console.error(`Parent subscription ${subId} has no data for payment notification`);
+            return null;
+        }
         const customerName = subData.customerName || 'N/A';
-        const amountPaid = paymentData.amountPaid || 0;
+        const amountPaid = typeof paymentData.amountPaid === 'number' ? paymentData.amountPaid : 0;
         const invoiceId = paymentData.stripeInvoiceId || 'N/A';
         const planType = subData.planType || 'N/A';
         const subscriptionStatus = subData.status || 'N/A';
@@ -387,7 +441,7 @@ export const sendPaymentReceivedNotification = functions
             <table style="width: 100%; border-collapse: collapse;">
             <tr>
                 <td style="padding: 8px; border: 1px solid #ddd;"><strong>Customer:</strong></td>
-                <td style="padding: 8px; border: 1px solid #ddd;">${customerName}</td>
+                <td style="padding: 8px; border: 1px solid #ddd;">${escapeHtml(customerName)}</td>
             </tr>
             <tr>
                 <td style="padding: 8px; border: 1px solid #ddd;"><strong>Amount:</strong></td>
@@ -395,15 +449,15 @@ export const sendPaymentReceivedNotification = functions
             </tr>
             <tr>
                 <td style="padding: 8px; border: 1px solid #ddd;"><strong>Plan:</strong></td>
-                <td style="padding: 8px; border: 1px solid #ddd;">${formatPlanType(planType)}</td>
+                <td style="padding: 8px; border: 1px solid #ddd;">${escapeHtml(formatPlanType(planType))}</td>
             </tr>
             <tr>
                 <td style="padding: 8px; border: 1px solid #ddd;"><strong>Invoice ID:</strong></td>
-                <td style="padding: 8px; border: 1px solid #ddd;">${invoiceId}</td>
+                <td style="padding: 8px; border: 1px solid #ddd;">${escapeHtml(invoiceId)}</td>
             </tr>
             <tr>
                 <td style="padding: 8px; border: 1px solid #ddd;"><strong>Status:</strong></td>
-                <td style="padding: 8px; border: 1px solid #ddd;">${subscriptionStatus}</td>
+                <td style="padding: 8px; border: 1px solid #ddd;">${escapeHtml(subscriptionStatus)}</td>
             </tr>
             </table>
             <p><a href="${adminLink}">View in Admin Panel</a></p>
@@ -453,6 +507,11 @@ export const onSubscriptionStatusChange = functions
         const afterData = change.after.data();
         const subId = context.params.subId;
 
+        if (!beforeData || !afterData) {
+            console.error(`Missing snapshot data for subscription ${subId}`);
+            return null;
+        }
+
         const beforeStatus = beforeData.status;
         const afterStatus = afterData.status;
 
@@ -480,7 +539,7 @@ async function notifyPaymentFailed(
     const customerPhone = data.customerPhone || 'N/A';
     const address = data.address || 'N/A';
     const planType = data.planType || 'N/A';
-    const priceInCents = data.priceInCents || 0;
+    const priceInCents = typeof data.priceInCents === 'number' ? data.priceInCents : 0;
     const adminLink = `https://www.suarezlawnservices.com/admin/subscriptions/${subId}`;
 
     const emailHtml = `
@@ -489,19 +548,19 @@ async function notifyPaymentFailed(
         <table style="width: 100%; border-collapse: collapse;">
         <tr>
             <td style="padding: 8px; border: 1px solid #ddd;"><strong>Customer:</strong></td>
-            <td style="padding: 8px; border: 1px solid #ddd;">${customerName}</td>
+            <td style="padding: 8px; border: 1px solid #ddd;">${escapeHtml(customerName)}</td>
         </tr>
         <tr>
             <td style="padding: 8px; border: 1px solid #ddd;"><strong>Phone:</strong></td>
-            <td style="padding: 8px; border: 1px solid #ddd;">${customerPhone}</td>
+            <td style="padding: 8px; border: 1px solid #ddd;">${escapeHtml(customerPhone)}</td>
         </tr>
         <tr>
             <td style="padding: 8px; border: 1px solid #ddd;"><strong>Address:</strong></td>
-            <td style="padding: 8px; border: 1px solid #ddd;">${address}</td>
+            <td style="padding: 8px; border: 1px solid #ddd;">${escapeHtml(address)}</td>
         </tr>
         <tr>
             <td style="padding: 8px; border: 1px solid #ddd;"><strong>Plan:</strong></td>
-            <td style="padding: 8px; border: 1px solid #ddd;">${formatPlanType(planType)}</td>
+            <td style="padding: 8px; border: 1px solid #ddd;">${escapeHtml(formatPlanType(planType))}</td>
         </tr>
         <tr>
             <td style="padding: 8px; border: 1px solid #ddd;"><strong>Price:</strong></td>
@@ -545,7 +604,7 @@ async function notifyCancellation(
 ): Promise<void> {
     const customerName = data.customerName || 'N/A';
     const planType = data.planType || 'N/A';
-    const priceInCents = data.priceInCents || 0;
+    const priceInCents = typeof data.priceInCents === 'number' ? data.priceInCents : 0;
     const canceledAt = data.canceledAt ? formatDate(data.canceledAt) : 'N/A';
     const adminLink = `https://www.suarezlawnservices.com/admin/subscriptions/${subId}`;
 
@@ -555,11 +614,11 @@ async function notifyCancellation(
         <table style="width: 100%; border-collapse: collapse;">
         <tr>
             <td style="padding: 8px; border: 1px solid #ddd;"><strong>Customer:</strong></td>
-            <td style="padding: 8px; border: 1px solid #ddd;">${customerName}</td>
+            <td style="padding: 8px; border: 1px solid #ddd;">${escapeHtml(customerName)}</td>
         </tr>
         <tr>
             <td style="padding: 8px; border: 1px solid #ddd;"><strong>Plan:</strong></td>
-            <td style="padding: 8px; border: 1px solid #ddd;">${formatPlanType(planType)}</td>
+            <td style="padding: 8px; border: 1px solid #ddd;">${escapeHtml(formatPlanType(planType))}</td>
         </tr>
         <tr>
             <td style="padding: 8px; border: 1px solid #ddd;"><strong>Price:</strong></td>
@@ -567,7 +626,7 @@ async function notifyCancellation(
         </tr>
         <tr>
             <td style="padding: 8px; border: 1px solid #ddd;"><strong>Canceled At:</strong></td>
-            <td style="padding: 8px; border: 1px solid #ddd;">${canceledAt}</td>
+            <td style="padding: 8px; border: 1px solid #ddd;">${escapeHtml(canceledAt)}</td>
         </tr>
         </table>
         <p><a href="${adminLink}">View in Admin Panel</a></p>
