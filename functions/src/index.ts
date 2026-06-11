@@ -231,7 +231,7 @@ function buildChecklistPdfDefinition(checklistId: string, checklist: any, title?
     };
 }
 
-async function uploadPdfBuffer(storagePath: string, buffer: Buffer): Promise<string> {
+async function uploadBufferToStorage(storagePath: string, buffer: Buffer, contentType: string): Promise<string> {
     const bucket = admin.storage().bucket();
     const token = admin.firestore().collection('_').doc().id;
     const file = bucket.file(storagePath);
@@ -239,7 +239,7 @@ async function uploadPdfBuffer(storagePath: string, buffer: Buffer): Promise<str
     await file.save(buffer, {
         resumable: false,
         metadata: {
-            contentType: 'application/pdf',
+            contentType,
             metadata: {
                 firebaseStorageDownloadTokens: token,
             },
@@ -247,6 +247,10 @@ async function uploadPdfBuffer(storagePath: string, buffer: Buffer): Promise<str
     });
 
     return `https://firebasestorage.googleapis.com/v0/b/${bucket.name}/o/${encodeURIComponent(storagePath)}?alt=media&token=${token}`;
+}
+
+async function uploadPdfBuffer(storagePath: string, buffer: Buffer): Promise<string> {
+    return uploadBufferToStorage(storagePath, buffer, 'application/pdf');
 }
 
 async function generateChecklistPdfFile(checklistId: string, title?: string): Promise<{ pdfUrl: string; buffer: Buffer }> {
@@ -1344,17 +1348,47 @@ export const handleIncomingSms = functions
             }
 
             const recipients = recipientPhoneNumbers.filter((n) => n !== fromNumber);
-            const text = messageBody
+
+            // This account enforces HTTP auth on inbound media (anonymous GET
+            // → 401), so Twilio's MMS sender can't fetch the original
+            // MediaUrls when forwarding (error 11200). Download each item
+            // ourselves (authenticated) and re-host it in Storage behind a
+            // tokened URL, then forward that.
+            const accountSid = twilioSid.value().trim();
+            const messageSid = String(params.MessageSid || params.SmsSid || 'unknown');
+            const rehostedUrls = (await Promise.all(mediaUrls.map(async (sourceUrl, index) => {
+                try {
+                    const resp = await fetch(sourceUrl, {
+                        headers: {
+                            Authorization: 'Basic ' + Buffer.from(`${accountSid}:${authToken}`).toString('base64'),
+                        },
+                    });
+                    if (!resp.ok) throw new Error(`media fetch returned ${resp.status}`);
+                    const contentType = (resp.headers.get('content-type') || 'application/octet-stream').split(';')[0];
+                    const ext = contentType.split('/')[1] || 'bin';
+                    const buffer = Buffer.from(await resp.arrayBuffer());
+                    return await uploadBufferToStorage(`team-relay/${messageSid}/${index}.${ext}`, buffer, contentType);
+                } catch (error) {
+                    console.error(`Failed to re-host media ${index} of ${messageSid}:`, error);
+                    return null;
+                }
+            }))).filter((url): url is string => Boolean(url));
+
+            const droppedCount = mediaUrls.length - rehostedUrls.length;
+            let text = messageBody
                 ? `${senderName}: ${messageBody}`
                 : `${senderName} sent ${mediaUrls.length} attachment(s)`;
+            if (droppedCount > 0) {
+                text += `\n(${droppedCount} attachment(s) could not be forwarded)`;
+            }
 
-            const client = twilio(twilioSid.value().trim(), authToken);
+            const client = twilio(accountSid, authToken);
             const results = await Promise.allSettled(recipients.map((to) =>
                 client.messages.create({
                     body: text,
                     from: twilioNumber,
                     to,
-                    ...(mediaUrls.length > 0 ? { mediaUrl: mediaUrls } : {}),
+                    ...(rehostedUrls.length > 0 ? { mediaUrl: rehostedUrls } : {}),
                 })
             ));
 
