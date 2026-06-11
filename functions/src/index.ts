@@ -5,8 +5,6 @@ import { defineSecret } from 'firebase-functions/params';
 import * as admin from 'firebase-admin';
 import * as nodemailer from 'nodemailer';
 import twilio from 'twilio';
-import express from 'express';
-import * as bodyParser from 'body-parser';
 const PdfPrinter = require('pdfmake');
 
 
@@ -1256,127 +1254,123 @@ async function notifyCancellation(
 
 
 /**
- * Cloud Function to handle incoming SMS messages from team members.
+ * Team SMS relay — incoming messages to the Twilio number from a team member
+ * are forwarded (text + any MMS media) to the other office staff
+ * (Richard / Daniel / Julia), prefixed with the sender's name.
+ *
+ * Loop safety: only messages FROM a known team member's personal number are
+ * relayed, the sender is excluded from the recipients, and anything claiming
+ * to be from our own Twilio number is dropped. Forwarded messages go out from
+ * the Twilio number, so a reply to a forward re-enters here as a new
+ * team-member message — relayed once to the others, never echoed back.
+ *
+ * NOTE: Twilio signs the EXACT webhook URL configured in the Twilio console.
+ * We pin that URL as a constant instead of reconstructing it from forwarded
+ * headers (the old reconstruction was fragile). If the webhook URL in the
+ * Twilio console ever changes, update TWILIO_WEBHOOK_URL to match.
  */
+const TWILIO_WEBHOOK_URL =
+    'https://us-central1-suarezlawnservices-sls.cloudfunctions.net/handleIncomingSms';
+
 export const handleIncomingSms = functions
     .runWith({ secrets: allSecrets })
-    .https.onRequest((req, res) => {
-    const app = express();
-
-    // Parse incoming form data
-    app.use(bodyParser.urlencoded({ extended: false }));
-
-    // Twilio webhook validation middleware
-    app.use((req, res, next) => {
-        // Reconstruct the full URL
-        const protocol = req.headers['x-forwarded-proto'] || 'https';
-        const host = req.headers['host'];
-        const url = req.originalUrl || req.url;
-        const fullUrl = `${protocol}://${host}${url}handleIncomingSms`;
-        // Log the full URL
-        console.log('Full URL used for validation:', fullUrl);
-
-        // Validate the Twilio request
-        const twilioSignature = req.headers['x-twilio-signature'] as string;
-        const isValid = twilio.validateRequest(
-            twilioToken.value(),
-            twilioSignature,
-            fullUrl,
-            req.body
-        );
-
-        if (!isValid) {
-            console.error('Invalid Twilio signature');
-            res.status(403).send('Invalid Twilio signature');
-        } else {
-            next();
-        }
-    });
-
-    // Handle the incoming SMS
-    app.post('*', async (req, res) => {
-        const fromNumber = req.body.From as string;
-        const messageBody = req.body.Body as string;
-
-        console.log('Received message from:', fromNumber);
-        console.log('Message body:', messageBody);
-
-        if (!fromNumber || !messageBody) {
-            res.status(400).send('Missing From or Body in request');
-            return;
-        }
-
-        if (!teamMembers[fromNumber]) {
-            // Not from a team member, ignore or handle as a customer message
-            res.status(200).send('Sender not in team members');
-            return;
-        }
-
-        const senderName = teamMembers[fromNumber];
-
-        // Prepare the message to send to other team members
-        const messageToSend = `${senderName}: ${messageBody}`;
-
-        // Send SMS to other team members
-        const otherTeamMembers = Object.keys(teamMembers).filter(number => number !== fromNumber);
+    .https.onRequest(async (req, res) => {
+        // Twilio expects a TwiML response; an empty <Response/> means
+        // "handled, don't auto-reply to the sender".
+        const respondTwiml = () => {
+            res.status(200).type('text/xml').send('<Response></Response>');
+        };
 
         try {
-            const client = twilio(twilioSid.value(), twilioToken.value());
-            const sendSMSPromises = otherTeamMembers.map(async (phoneNumber) => {
-                console.log(`Sending message to ${phoneNumber}`);
-                await client.messages.create({
-                    body: messageToSend,
-                    from: twilioPhone.value(),
-                    to: phoneNumber
-                });
+            if (req.method !== 'POST') {
+                res.status(405).send('Method not allowed');
+                return;
+            }
+
+            // Firebase already parses the urlencoded body into req.body.
+            const params = (req.body || {}) as Record<string, string>;
+
+            // Signature is an exact-bytes HMAC — .trim() matters: secret values
+            // stored with a trailing newline broke validation for months while
+            // outbound API calls (which tolerate whitespace) kept working.
+            const authToken = twilioToken.value().trim();
+            const twilioSignature = String(req.headers['x-twilio-signature'] || '');
+            const isValid = twilio.validateRequest(
+                authToken,
+                twilioSignature,
+                TWILIO_WEBHOOK_URL,
+                params
+            );
+            if (!isValid) {
+                console.error('Invalid Twilio signature');
+                res.status(403).send('Invalid Twilio signature');
+                return;
+            }
+
+            const fromNumber = String(params.From || '');
+            const messageBody = String(params.Body || '').trim();
+
+            // Collect MMS attachments (MediaUrl0..N) so images/files relay too.
+            const numMedia = Math.min(parseInt(String(params.NumMedia || '0'), 10) || 0, 10);
+            const mediaUrls: string[] = [];
+            for (let i = 0; i < numMedia; i++) {
+                const url = params[`MediaUrl${i}`];
+                if (url) mediaUrls.push(String(url));
+            }
+
+            console.log(`Received message from ${fromNumber} (${mediaUrls.length} media):`, messageBody);
+
+            const twilioNumber = twilioPhone.value().trim();
+            if (!fromNumber || fromNumber === twilioNumber) {
+                // Our own number or malformed — never relay (loop guard).
+                respondTwiml();
+                return;
+            }
+
+            const senderName = teamMembers[fromNumber];
+            if (!senderName) {
+                // Not from a team member — likely a customer texting the
+                // notification number. Acknowledge without relaying.
+                console.log('Sender not in team members:', fromNumber);
+                respondTwiml();
+                return;
+            }
+
+            if (!messageBody && mediaUrls.length === 0) {
+                respondTwiml();
+                return;
+            }
+
+            const recipients = recipientPhoneNumbers.filter((n) => n !== fromNumber);
+            const text = messageBody
+                ? `${senderName}: ${messageBody}`
+                : `${senderName} sent ${mediaUrls.length} attachment(s)`;
+
+            const client = twilio(twilioSid.value().trim(), authToken);
+            const results = await Promise.allSettled(recipients.map((to) =>
+                client.messages.create({
+                    body: text,
+                    from: twilioNumber,
+                    to,
+                    ...(mediaUrls.length > 0 ? { mediaUrl: mediaUrls } : {}),
+                })
+            ));
+
+            let sent = 0;
+            results.forEach((result, i) => {
+                if (result.status === 'rejected') {
+                    console.error(`Relay to ${recipients[i]} failed:`, result.reason);
+                } else {
+                    sent++;
+                }
             });
-
-            await Promise.all(sendSMSPromises);
-
-            console.log('Message forwarded to team members');
-            res.status(200).send('Message forwarded');
+            console.log(`Relayed ${senderName}'s message to ${sent}/${recipients.length} staff`);
+            respondTwiml();
         } catch (error) {
-            console.error('Error sending SMS:', error);
-            res.status(500).send('Error sending SMS');
+            console.error('handleIncomingSms error:', error);
+            res.status(500).send('Internal error');
         }
     });
-
-    // Pass the request to the Express app
-    app(req, res);
-});
-
-
-// /**
-//  * Validates that incoming requests genuinely came from Twilio.
-//  *
-//  * @param {string} authToken - Your Twilio Auth Token.
-//  * @param {string} twilioSignature - The signature from Twilio in the request headers.
-//  * @param {string} url - The full URL of the request.
-//  * @param {Record<string, any>} params - The body parameters of the request.
-//  * @return {boolean} - True if the request is valid, false otherwise.
-//  */
-// function validateTwilioRequest(
-//     authToken: string,
-//     twilioSignature: string,
-//     url: string,
-//     params: Record<string, any>
-// ): boolean {
-//     const sortedParams = Object.keys(params)
-//         .sort()
-//         .reduce((acc: Record<string, any>, key: string) => {
-//             acc[key] = params[key];
-//             return acc;
-//         }, {});
-
-//     const data = url + Object.keys(sortedParams).reduce((acc, key) => acc + key + sortedParams[key], '');
-
-//     const computedSignature = crypto
-//         .createHmac('sha1', authToken)
-//         .update(Buffer.from(data, 'utf-8'))
-//         .digest('base64');
-
-//     return twilioSignature === computedSignature;
-// }
 
 
 
@@ -1399,7 +1393,7 @@ async function sendEmail(
         service: 'gmail',
         auth: {
             user: gmailUser,
-            pass: gmailPass.value()
+            pass: gmailPass.value().trim()
         }
     });
 
@@ -1429,12 +1423,12 @@ async function sendSMS(
         statusCallback?: string;
     }
 ): Promise<string[]> {
-    const client = twilio(twilioSid.value(), twilioToken.value());
+    const client = twilio(twilioSid.value().trim(), twilioToken.value().trim());
     const targets = options?.to || recipientPhoneNumbers;
     const messages = await Promise.all(targets.map((phoneNumber) =>
         client.messages.create({
             body: body,
-            from: twilioPhone.value(),
+            from: twilioPhone.value().trim(),
             to: phoneNumber,
             ...(options?.statusCallback ? { statusCallback: options.statusCallback } : {}),
         })
