@@ -24,8 +24,10 @@ const allSecrets = [gmailPass, twilioSid, twilioToken, twilioPhone];
 // Email config
 const gmailUser = "RichardSV15@gmail.com";
 
-// Email recipients
-const recipientEmails = ['RichardSV15@gmail.com', 'DanielSV17@gmail.com'];
+// Email recipients. The LLC inbox is included so notifications land in the
+// actively-monitored business account too (personal inboxes can filter
+// self-/peer-sent Gmail unpredictably).
+const recipientEmails = ['RichardSV15@gmail.com', 'DanielSV17@gmail.com', 'SuarezLawnServices.LLC@gmail.com'];
 
 // Recipient phone numbers
 const recipientPhoneNumbers = ['+15595675330', '+15595677354', '+15592136764'];
@@ -37,8 +39,6 @@ const teamMembers: { [phoneNumber: string]: string } = {
     '+15592419140': 'Inocencio'
 };
 
-const RICHARD_EMAIL = 'RichardSV15@gmail.com';
-const RICHARD_PHONE = '+15595675330';
 
 
 // ── Utility Helpers ──
@@ -77,50 +77,7 @@ function capitalize(str: string): string {
     return str.charAt(0).toUpperCase() + str.slice(1);
 }
 
-function flattenChecklistItems(data: any): Array<{ key: string; label: string; flagged: boolean; photoUrls: string[] }> {
-    const items: Array<{ key: string; label: string; flagged: boolean; photoUrls: string[] }> = [];
-    const sections = Array.isArray(data?.sections) ? data.sections : [];
 
-    sections.forEach((section: any) => {
-        const sectionId = String(section?.sectionId || section?.id || 'section');
-        const sectionItems = Array.isArray(section?.items) ? section.items : [];
-        sectionItems.forEach((item: any) => {
-            items.push({
-                key: `${sectionId}:${String(item?.id || item?.label || 'item')}`,
-                label: String(item?.label || item?.id || 'Checklist item'),
-                flagged: Boolean(item?.flagged),
-                photoUrls: Array.isArray(item?.photoUrls) ? item.photoUrls : [],
-            });
-        });
-    });
-
-    return items;
-}
-
-function getNewHazards(beforeData: any, afterData: any): any[] {
-    const beforeIds = new Set(
-        (Array.isArray(beforeData?.hazards) ? beforeData.hazards : []).map((hazard: any) =>
-            String(hazard?.id || '')
-        )
-    );
-
-    return (Array.isArray(afterData?.hazards) ? afterData.hazards : []).filter(
-        (hazard: any) => !beforeIds.has(String(hazard?.id || ''))
-    );
-}
-
-function getNewFlaggedItems(beforeData: any, afterData: any): Array<{ label: string; photoUrls: string[] }> {
-    const beforeMap = new Map(
-        flattenChecklistItems(beforeData).map((item) => [item.key, item])
-    );
-
-    return flattenChecklistItems(afterData)
-        .filter((item) => item.flagged && !beforeMap.get(item.key)?.flagged)
-        .map((item) => ({
-            label: item.label,
-            photoUrls: item.photoUrls,
-        }));
-}
 
 function getPdfFonts() {
     return {
@@ -307,11 +264,37 @@ async function generateChecklistPdfFile(checklistId: string, title?: string): Pr
     return { pdfUrl, buffer: pdfBuffer };
 }
 
-function getPreviousMonthRange() {
+function getMonthRange(month?: string) {
+    if (month) {
+        if (!/^\d{4}-\d{2}$/.test(month)) {
+            throw new Error('Invalid month format');
+        }
+        const [yearString, monthString] = month.split('-');
+        const year = Number(yearString);
+        const monthIndex = Number(monthString) - 1;
+        if (!Number.isInteger(year) || !Number.isInteger(monthIndex) || monthIndex < 0 || monthIndex > 11) {
+            throw new Error('Invalid month format');
+        }
+
+        const start = new Date(Date.UTC(year, monthIndex, 1));
+        const end = new Date(Date.UTC(year, monthIndex + 1, 1));
+        return {
+            month,
+            start: start.toISOString().slice(0, 10),
+            end: end.toISOString().slice(0, 10),
+            label: start.toLocaleString('en-US', {
+                month: 'long',
+                year: 'numeric',
+                timeZone: 'America/Los_Angeles',
+            }),
+        };
+    }
+
     const now = new Date();
     const start = new Date(now.getFullYear(), now.getMonth() - 1, 1);
     const end = new Date(now.getFullYear(), now.getMonth(), 1);
     return {
+        month: start.toISOString().slice(0, 7),
         start: start.toISOString().slice(0, 10),
         end: end.toISOString().slice(0, 10),
         label: start.toLocaleString('en-US', {
@@ -322,7 +305,114 @@ function getPreviousMonthRange() {
     };
 }
 
-export const onChecklistHazardOrDefectReported = functions
+async function loadMonthlyChecklistEntries(filters: { month?: string; department?: string | null; truckId?: string | null }) {
+    const range = getMonthRange(filters.month);
+    const snapshot = await admin.firestore()
+        .collection('checklists')
+        .where('date', '>=', range.start)
+        .where('date', '<', range.end)
+        .get();
+
+    const checklists = snapshot.docs
+        .map((doc) => ({
+            id: doc.id,
+            ...doc.data(),
+        }))
+        .filter((entry: any) => {
+            if (filters.department && entry.department !== filters.department) {
+                return false;
+            }
+            if (filters.truckId && entry.truckId !== filters.truckId) {
+                return false;
+            }
+            return true;
+        })
+        .sort((a: any, b: any) => {
+            if (a.date === b.date) {
+                return String(a.truckDisplayName || a.truckId || a.id).localeCompare(
+                    String(b.truckDisplayName || b.truckId || b.id)
+                );
+            }
+            return String(a.date || '').localeCompare(String(b.date || ''));
+        });
+
+    return { range, checklists };
+}
+
+async function generateMonthlyChecklistReportFile(filters: { month?: string; department?: string | null; truckId?: string | null }) {
+    const { range, checklists } = await loadMonthlyChecklistEntries(filters);
+
+    if (checklists.length === 0) {
+        throw new Error('No checklists found for the selected month');
+    }
+
+    const scopeParts = [
+        filters.department ? `Department: ${capitalize(filters.department)}` : null,
+        filters.truckId ? `Truck: ${filters.truckId}` : null,
+    ].filter(Boolean);
+    const scopeLabel = scopeParts.length > 0 ? ` (${scopeParts.join(' · ')})` : '';
+
+    const summaryDefinition = {
+        pageMargins: [32, 32, 32, 32],
+        content: [
+            { text: 'Suarez Lawn Services', style: 'header' },
+            { text: `Monthly Checklist Report - ${range.label}${scopeLabel}`, style: 'subheader' },
+            {
+                table: {
+                    widths: ['*', 80, 90, 80],
+                    body: [
+                        [
+                            { text: 'Truck', bold: true },
+                            { text: 'Date', bold: true },
+                            { text: 'Status', bold: true },
+                            { text: 'Hazards', bold: true },
+                        ],
+                        ...checklists.map((entry: any) => [
+                            { text: entry.truckDisplayName || entry.truckId || entry.id },
+                            { text: entry.date || 'N/A' },
+                            { text: String(entry.status || 'N/A').replace('_', ' ') },
+                            { text: String((entry.hazards || []).length) },
+                        ]),
+                    ],
+                },
+            },
+            ...checklists.flatMap((entry: any, index: number) => ([
+                { text: '', pageBreak: index === 0 ? undefined : 'before' },
+                ...buildChecklistPdfDefinition(entry.id, entry, `Checklist ${index + 1}`).content,
+            ])),
+        ],
+        styles: {
+            header: { fontSize: 18, bold: true },
+            subheader: { fontSize: 13, margin: [0, 4, 0, 12] },
+        },
+        defaultStyle: {
+            font: 'Helvetica',
+            fontSize: 10,
+        },
+    };
+
+    const pdfBuffer = await createPdfBuffer(summaryDefinition);
+    const pathParts = ['reports', 'checklists', 'monthly', range.month];
+    if (filters.department) pathParts.push(filters.department);
+    if (filters.truckId) pathParts.push(filters.truckId);
+    const storagePath = `${pathParts.join('/')}.pdf`;
+    const pdfUrl = await uploadPdfBuffer(storagePath, pdfBuffer);
+
+    return {
+        pdfUrl,
+        buffer: pdfBuffer,
+        checklistCount: checklists.length,
+        label: range.label,
+    };
+}
+
+/**
+ * Checklist submission alert — fires only on status transitions
+ * (morning_complete or completed) and only if there are actionable
+ * items: notes on required items, hazards, or unfixed defects.
+ * Sends email only (no SMS) to the business inbox.
+ */
+export const onChecklistSubmissionAlert = functions
     .runWith({ secrets: allSecrets })
     .firestore
     .document('checklists/{checklistId}')
@@ -332,59 +422,81 @@ export const onChecklistHazardOrDefectReported = functions
 
         if (!beforeData || !afterData) return null;
 
-        const newHazards = getNewHazards(beforeData, afterData);
-        const newFlaggedItems = getNewFlaggedItems(beforeData, afterData);
+        const beforeStatus = String(beforeData.status || '');
+        const afterStatus = String(afterData.status || '');
 
-        if (newHazards.length === 0 && newFlaggedItems.length === 0) {
+        // Only fire on actual submission transitions
+        const isMorningSubmission = beforeStatus !== 'morning_complete' && afterStatus === 'morning_complete';
+        const isDayCompletion = beforeStatus !== 'completed' && afterStatus === 'completed';
+
+        if (!isMorningSubmission && !isDayCompletion) return null;
+
+        // Collect actionable items: required items with notes, all hazards, unfixed flagged items
+        const sections = Array.isArray(afterData.sections) ? afterData.sections : [];
+        const hazards = Array.isArray(afterData.hazards) ? afterData.hazards : [];
+
+        const itemsWithNotes: Array<{ label: string; note: string; photoUrls: string[] }> = [];
+        sections.forEach((section: any) => {
+            const items = Array.isArray(section?.items) ? section.items : [];
+            items.forEach((item: any) => {
+                if (item?.required && item?.note && String(item.note).trim()) {
+                    itemsWithNotes.push({
+                        label: String(item.label || 'Item'),
+                        note: String(item.note),
+                        photoUrls: Array.isArray(item.photoUrls) ? item.photoUrls : [],
+                    });
+                }
+            });
+        });
+
+        const unfixedHazards = hazards.filter((h: any) => !h.fixed);
+
+        // Nothing actionable — no email needed
+        if (itemsWithNotes.length === 0 && hazards.length === 0) {
             return null;
         }
 
         const checklistId = context.params.checklistId;
         const adminLink = `https://www.suarezlawnservices.com/admin/checklists`;
         const truckName = afterData.truckDisplayName || afterData.truckId || checklistId;
-        const employeeName = afterData.completedByName || afterData.signature?.employeeName || 'Field employee';
+        const submittedBy = afterData.morningCompletedByName || afterData.completedByName
+            || afterData.signature?.employeeName || 'Field employee';
+        const phase = isDayCompletion ? 'End of Day' : 'Morning Inspection';
 
-        const hazardHtml = newHazards.map((hazard: any) => `
-            <li><strong>Hazard:</strong> ${hazard.hazardFound || 'N/A'}<br />
-            Location: ${hazard.location || 'N/A'} · Fixed: ${hazard.fixed ? 'Yes' : 'No'}<br />
-            Photos: ${(hazard.photoUrls || []).join(', ') || 'None'}</li>
+        const notesHtml = itemsWithNotes.map((item) => `
+            <li><strong>${item.label}</strong><br />
+            Note: ${item.note}
+            ${item.photoUrls.length > 0 ? `<br />Photos: ${item.photoUrls.join(', ')}` : ''}</li>
         `).join('');
 
-        const flaggedHtml = newFlaggedItems.map((item) => `
-            <li><strong>Flagged Item:</strong> ${item.label}<br />
-            Photos: ${item.photoUrls.join(', ') || 'None'}</li>
+        const hazardHtml = hazards.map((hazard: any) => `
+            <li><strong>${hazard.hazardFound || 'N/A'}</strong><br />
+            Location: ${hazard.location || 'N/A'} ·
+            Fixed: ${hazard.fixed ? 'Yes' : '<strong style="color:red">No</strong>'}
+            ${hazard.correctiveAction ? `<br />Action: ${hazard.correctiveAction}` : ''}
+            ${(hazard.photoUrls || []).length > 0 ? `<br />Photos: ${hazard.photoUrls.join(', ')}` : ''}</li>
         `).join('');
+
+        const subjectParts = [];
+        if (unfixedHazards.length > 0) subjectParts.push(`${unfixedHazards.length} unfixed hazard(s)`);
+        if (itemsWithNotes.length > 0) subjectParts.push(`${itemsWithNotes.length} noted issue(s)`);
+        if (subjectParts.length === 0 && hazards.length > 0) subjectParts.push(`${hazards.length} hazard(s) reported`);
 
         const html = `
-            <h2>Checklist Hazard / Defect Alert</h2>
-            <p>A new hazard or flagged defect was reported.</p>
+            <h2>Checklist Action Required</h2>
             <p><strong>Truck:</strong> ${truckName}<br />
-            <strong>Employee:</strong> ${employeeName}<br />
+            <strong>Submitted by:</strong> ${submittedBy}<br />
+            <strong>Phase:</strong> ${phase}<br />
             <strong>Date:</strong> ${afterData.date || 'N/A'}</p>
-            ${newHazards.length > 0 ? `<h3>New Hazards</h3><ul>${hazardHtml}</ul>` : ''}
-            ${newFlaggedItems.length > 0 ? `<h3>New Flagged Items</h3><ul>${flaggedHtml}</ul>` : ''}
+            ${itemsWithNotes.length > 0 ? `<h3>Required Items with Notes</h3><ul>${notesHtml}</ul>` : ''}
+            ${hazards.length > 0 ? `<h3>Hazards Reported</h3><ul>${hazardHtml}</ul>` : ''}
             <p><a href="${adminLink}">Open Admin Checklist View</a></p>
         `;
 
-        const smsBody = [
-            'SLS: Checklist alert',
-            '',
-            `Truck: ${truckName}`,
-            `Employee: ${employeeName}`,
-            `Date: ${afterData.date || 'N/A'}`,
-            ...newHazards.map((hazard: any) => `Hazard: ${hazard.hazardFound || 'N/A'}`),
-            ...newFlaggedItems.map((item) => `Flagged: ${item.label}`),
-            adminLink,
-        ].join('\n');
-
         await sendEmail(
-            `Checklist Alert - ${truckName}`,
+            `Checklist: ${subjectParts.join(', ')} — ${truckName}`,
             html,
-            { to: [RICHARD_EMAIL] }
-        );
-        await sendSMS(
-            smsBody,
-            { to: [RICHARD_PHONE] }
+            { to: ['SuarezLawnServices.LLC@gmail.com'] }
         );
 
         return null;
@@ -412,24 +524,55 @@ export const generateChecklistPdf = functions
         }
     });
 
+export const generateMonthlyChecklistReportPdf = functions
+    .https.onRequest(async (req, res) => {
+        if (req.method !== 'POST') {
+            res.status(405).json({ error: 'Method not allowed' });
+            return;
+        }
+
+        try {
+            const month = req.body?.month ? String(req.body.month).trim() : undefined;
+            const department = req.body?.department ? String(req.body.department).trim() : null;
+            const truckId = req.body?.truckId ? String(req.body.truckId).trim() : null;
+
+            const result = await generateMonthlyChecklistReportFile({
+                month,
+                department,
+                truckId,
+            });
+
+            res.status(200).json(result);
+        } catch (error: any) {
+            console.error('Error generating monthly checklist PDF:', error);
+            res.status(500).json({ error: error?.message || 'Failed to generate monthly checklist PDF' });
+        }
+    });
+
 export const monthlyChecklistReport = functions
     .runWith({ secrets: allSecrets })
     .pubsub.schedule('0 8 1 * *')
     .timeZone('America/Los_Angeles')
     .onRun(async () => {
-        const range = getPreviousMonthRange();
-        const snapshot = await admin.firestore()
-            .collection('checklists')
-            .where('date', '>=', range.start)
-            .where('date', '<', range.end)
-            .get();
+        let result;
+        try {
+            result = await generateMonthlyChecklistReportFile({});
+        } catch (error: any) {
+            if (error?.message === 'No checklists found for the selected month') {
+                const range = getMonthRange();
+                await sendEmail(
+                    `Monthly Checklist Report - ${range.label}`,
+                    `<p>No checklists were recorded for ${range.label}.</p>`,
+                    { to: ['SuarezLawnServices.LLC@gmail.com'] }
+                );
+                return null;
+            }
 
-        const checklists = snapshot.docs.map((doc) => ({
-            id: doc.id,
-            ...doc.data(),
-        }));
+            throw error;
+        }
 
-        if (checklists.length === 0) {
+        const range = getMonthRange();
+        if (!result) {
             await sendEmail(
                 `Monthly Checklist Report - ${range.label}`,
                 `<p>No checklists were recorded for ${range.label}.</p>`,
@@ -437,47 +580,6 @@ export const monthlyChecklistReport = functions
             );
             return null;
         }
-
-        const summaryDefinition = {
-            pageMargins: [32, 32, 32, 32],
-            content: [
-                { text: 'Suarez Lawn Services', style: 'header' },
-                { text: `Monthly Checklist Report - ${range.label}`, style: 'subheader' },
-                {
-                    table: {
-                        widths: ['*', 80, 90, 80],
-                        body: [
-                            [
-                                { text: 'Truck', bold: true },
-                                { text: 'Date', bold: true },
-                                { text: 'Status', bold: true },
-                                { text: 'Hazards', bold: true },
-                            ],
-                            ...checklists.map((entry: any) => [
-                                { text: entry.truckDisplayName || entry.truckId || entry.id },
-                                { text: entry.date || 'N/A' },
-                                { text: String(entry.status || 'N/A').replace('_', ' ') },
-                                { text: String((entry.hazards || []).length) },
-                            ]),
-                        ],
-                    },
-                },
-                ...checklists.flatMap((entry: any, index: number) => ([
-                    { text: '', pageBreak: index === 0 ? undefined : 'before' },
-                    ...buildChecklistPdfDefinition(entry.id, entry, `Checklist ${index + 1}`).content,
-                ])),
-            ],
-            styles: {
-                header: { fontSize: 18, bold: true },
-                subheader: { fontSize: 13, margin: [0, 4, 0, 12] },
-            },
-            defaultStyle: {
-                font: 'Helvetica',
-                fontSize: 10,
-            },
-        };
-
-        const pdfBuffer = await createPdfBuffer(summaryDefinition);
         const attachmentName = `monthly-checklists-${range.start}.pdf`;
 
         await sendEmail(
@@ -488,7 +590,7 @@ export const monthlyChecklistReport = functions
                 attachments: [
                     {
                         filename: attachmentName,
-                        content: pdfBuffer,
+                        content: result.buffer,
                         contentType: 'application/pdf',
                     },
                 ],
@@ -592,7 +694,17 @@ export const sendCompletionNotification = functions
             </table>
         `;
 
-        // Construct the SMS message body (compact, SMS-friendly)
+        // Construct the SMS message body (compact, SMS-friendly).
+        //
+        // Long customer free-text MUST be truncated: a ~1,300-char pasted
+        // project description pushed a request SMS past the carrier content
+        // limit (Twilio error 30019) on 2026-06-10 and ALL recipients silently
+        // missed it. Full details are always in the email + dashboard link.
+        const truncateForSms = (text: string, max: number): string => {
+            const s = String(text).trim();
+            return s.length > max ? `${s.slice(0, max).trimEnd()}… [see email/link]` : s;
+        };
+
         const smsLines: string[] = [];
         smsLines.push('SLS: New service request!!!');
         smsLines.push('');
@@ -611,34 +723,67 @@ export const sendCompletionNotification = functions
         } else if (typeof newValue.recurringServices === 'string' && newValue.recurringServices.trim().length > 0) {
             smsLines.push(`Recurring: ${newValue.recurringServices}`);
         }
-        if (newValue.oneTimeServices.length > 0) smsLines.push(`One-time: ${newValue.oneTimeServices}`);
-        if (newValue.landscapingServices.length > 0) smsLines.push(`Landscape: ${newValue.landscapingServices}`);
+        // Guard with String(... || '') — legacy docs may omit these fields, and a
+        // throw here means NO notification at all.
+        if (String(newValue.oneTimeServices || '').length > 0) smsLines.push(`One-time: ${newValue.oneTimeServices}`);
+        if (String(newValue.landscapingServices || '').length > 0) smsLines.push(`Landscape: ${newValue.landscapingServices}`);
         smsLines.push('');
-        if (newValue.optionalDetails) smsLines.push(`Optional: ${newValue.optionalDetails}`);
-        if (newValue.additionalInfo) smsLines.push(`Additional: ${newValue.additionalInfo}`);
-        if (newValue.request_photo_urls) smsLines.push(`Additional images: ${newValue.request_photo_urls.length}`);
-        if (newValue.special_offer_photo_url != null) smsLines.push('Promo image: Yes!');
+        // Link goes BEFORE the free-text details so it survives any truncation.
         smsLines.push(`https://www.suarezlawnservices.com/service-request/${requestId}`);
         if (customerEmail !== 'N/A') smsLines.push(`Email: ${customerEmail}`);
+        if (newValue.optionalDetails) smsLines.push(`Optional: ${truncateForSms(newValue.optionalDetails, 200)}`);
+        if (newValue.additionalInfo) smsLines.push(`Additional: ${truncateForSms(newValue.additionalInfo, 200)}`);
+        if (Array.isArray(newValue.request_photo_urls) && newValue.request_photo_urls.length > 0) {
+            smsLines.push(`Additional images: ${newValue.request_photo_urls.length}`);
+        }
+        if (newValue.special_offer_photo_url != null) smsLines.push('Promo image: Yes!');
         smsLines.push(`ID: ${requestId}`);
-        const textMessageBody = smsLines.join('\n');
+        let textMessageBody = smsLines.join('\n');
+        // Final safety cap — well under Twilio's 1,600-char limit and carrier
+        // segment caps. The link sits early in the body, so it always survives.
+        if (textMessageBody.length > 1000) {
+            textMessageBody = `${textMessageBody.slice(0, 1000).trimEnd()}…`;
+        }
 
         const mode = newValue.mode || 'live';
 
         if (mode === 'live') {
+            // Per-channel result, written back to the request doc so the admin
+            // dashboard can show delivery status instead of failures being
+            // invisible (Twilio "accepted" ≠ delivered).
+            const notifications: Record<string, unknown> = {};
+
             console.log('LIVE MODE: Sending email');
             try {
                 await sendEmail('New Service Request', messageBody);
                 console.log('Email sent successfully');
+                notifications.email = { status: 'sent', to: recipientEmails };
             } catch (error) {
                 console.error('Error sending email:', error);
+                notifications.email = { status: 'failed', error: String(error) };
             }
 
             try {
-                await sendSMS(textMessageBody);
-                console.log('SMS sent successfully');
+                const statusCallback =
+                    `https://us-central1-suarezlawnservices-sls.cloudfunctions.net/twilioSmsStatus?requestId=${requestId}`;
+                const sids = await sendSMS(textMessageBody, { statusCallback });
+                console.log('SMS accepted by Twilio:', sids.join(', '));
+                // "accepted" — final per-recipient delivery status arrives via
+                // the twilioSmsStatus callback and is recorded under
+                // notifications.sms.delivery.{sid}.
+                notifications.sms = { status: 'accepted', sids, to: recipientPhoneNumbers };
             } catch (error) {
                 console.error('Error sending SMS:', error);
+                notifications.sms = { status: 'failed', error: String(error) };
+            }
+
+            try {
+                await snapshot.ref.set(
+                    { notifications: { ...notifications, at: admin.firestore.FieldValue.serverTimestamp() } },
+                    { merge: true }
+                );
+            } catch (error) {
+                console.error('Error writing notification status:', error);
             }
 
         } else {
@@ -647,6 +792,92 @@ export const sendCompletionNotification = functions
         }
 
         return null;
+    });
+
+
+/**
+ * Twilio SMS status callback — records the FINAL delivery status of each
+ * team-notification SMS on the originating serviceRequests doc, and emails the
+ * team when a message fails to deliver (e.g. carrier content filtering, which
+ * Twilio reports AFTER accepting the send).
+ *
+ * Auth: instead of fragile signature/URL reconstruction, we require that the
+ * posted MessageSid matches one of the SIDs we stored on the request doc when
+ * sending — only Twilio (and this project) know those SIDs.
+ */
+export const twilioSmsStatus = functions
+    .runWith({ secrets: allSecrets })
+    .https.onRequest(async (req, res) => {
+        try {
+            const requestId = String(req.query.requestId || '');
+            const messageSid = String(req.body?.MessageSid || req.body?.SmsSid || '');
+            const messageStatus = String(req.body?.MessageStatus || '');
+            const to = String(req.body?.To || '');
+            const errorCode = req.body?.ErrorCode ? String(req.body.ErrorCode) : null;
+
+            if (!requestId || !messageSid || !messageStatus) {
+                res.status(400).send('Missing requestId, MessageSid, or MessageStatus');
+                return;
+            }
+
+            const docRef = admin.firestore().collection('serviceRequests').doc(requestId);
+            const snap = await docRef.get();
+            if (!snap.exists) {
+                res.status(404).send('Unknown request');
+                return;
+            }
+            const data = snap.data() || {};
+            const knownSids: string[] = data.notifications?.sms?.sids || [];
+            if (!knownSids.includes(messageSid)) {
+                console.error(`SID ${messageSid} not registered on request ${requestId}`);
+                res.status(403).send('Unknown message SID');
+                return;
+            }
+
+            const prevStatus: string | undefined =
+                data.notifications?.sms?.delivery?.[messageSid]?.status;
+
+            await docRef.set({
+                notifications: {
+                    sms: {
+                        delivery: {
+                            [messageSid]: {
+                                to,
+                                status: messageStatus,
+                                errorCode,
+                                at: admin.firestore.FieldValue.serverTimestamp(),
+                            },
+                        },
+                    },
+                },
+            }, { merge: true });
+
+            // Terminal failure → alert the team by email (a different failure
+            // domain than SMS). Guard against duplicate callbacks for the same
+            // terminal status.
+            const isFailure = messageStatus === 'undelivered' || messageStatus === 'failed';
+            if (isFailure && prevStatus !== messageStatus) {
+                const name = teamMembers[to] || to;
+                console.error(`SMS to ${to} ${messageStatus} (error ${errorCode}) for request ${requestId}`);
+                try {
+                    await sendEmail(
+                        `⚠️ SMS notification FAILED — service request ${requestId}`,
+                        `<p>The new-service-request SMS to <strong>${name}</strong> (${to}) was ` +
+                        `<strong>${messageStatus}</strong>${errorCode ? ` (Twilio error ${errorCode})` : ''}.</p>` +
+                        `<p>Customer: ${data.fullName || 'N/A'} — ${data.phoneNumber || 'N/A'}</p>` +
+                        `<p><a href="https://www.suarezlawnservices.com/service-request/${requestId}">View the request</a> ` +
+                        `so it doesn't get missed.</p>`
+                    );
+                } catch (error) {
+                    console.error('Error sending SMS-failure alert email:', error);
+                }
+            }
+
+            res.status(200).send('OK');
+        } catch (error) {
+            console.error('twilioSmsStatus error:', error);
+            res.status(500).send('Internal error');
+        }
     });
 
 
@@ -1193,17 +1424,20 @@ async function sendSMS(
     body: string,
     options?: {
         to?: string[];
+        /** Twilio status-callback URL — Twilio POSTs delivery updates
+         *  (sent/delivered/undelivered/failed) per message. */
+        statusCallback?: string;
     }
-): Promise<void> {
+): Promise<string[]> {
     const client = twilio(twilioSid.value(), twilioToken.value());
     const targets = options?.to || recipientPhoneNumbers;
-    const sendSMSPromises = targets.map(async (phoneNumber) => {
-        await client.messages.create({
+    const messages = await Promise.all(targets.map((phoneNumber) =>
+        client.messages.create({
             body: body,
             from: twilioPhone.value(),
-            to: phoneNumber
-        });
-    });
-
-    await Promise.all(sendSMSPromises);
+            to: phoneNumber,
+            ...(options?.statusCallback ? { statusCallback: options.statusCallback } : {}),
+        })
+    ));
+    return messages.map((m) => m.sid);
 }
