@@ -54,15 +54,21 @@ function formatPlanType(planType: string): string {
     return labels[planType] || planType;
 }
 
-/** Format cents to dollar string */
-function formatPrice(cents: number): string {
-    return `$${(cents / 100).toFixed(2)}`;
+/** Format cents to dollar string. Coerces missing/non-numeric values to $0.00
+ * so a legacy doc without `priceInCents` doesn't render "$NaN" in emails/SMS. */
+function formatPrice(cents: number | null | undefined): string {
+    const n = typeof cents === 'number' ? cents : Number(cents);
+    if (!Number.isFinite(n)) return '$0.00';
+    return `$${(n / 100).toFixed(2)}`;
 }
 
 /** Format a Firestore timestamp or ISO string to readable Pacific Time date */
 function formatDate(dateValue: any): string {
     if (!dateValue) return 'N/A';
-    const date = dateValue.toDate ? dateValue.toDate() : new Date(dateValue);
+    const date = dateValue?.toDate ? dateValue.toDate() : new Date(dateValue);
+    // Guard against unparseable strings/numbers — otherwise we'd render the
+    // literal "Invalid Date" into emails/SMS/PDF.
+    if (!(date instanceof Date) || isNaN(date.getTime())) return 'N/A';
     return date.toLocaleString('en-US', {
         timeZone: 'America/Los_Angeles',
         month: 'long',
@@ -75,6 +81,20 @@ function formatDate(dateValue: any): string {
 function capitalize(str: string): string {
     if (!str) return str;
     return str.charAt(0).toUpperCase() + str.slice(1);
+}
+
+/** Escape HTML special characters in user-supplied strings before embedding
+ * in HTML email bodies. Customer form fields and free-text inputs flow into
+ * `<td>${value}</td>` templates below; without escaping, a value containing
+ * `<` / `>` / quotes breaks layout and lets arbitrary markup through. */
+function escapeHtml(value: any): string {
+    if (value == null) return '';
+    return String(value)
+        .replace(/&/g, '&amp;')
+        .replace(/</g, '&lt;')
+        .replace(/>/g, '&gt;')
+        .replace(/"/g, '&quot;')
+        .replace(/'/g, '&#39;');
 }
 
 
@@ -159,9 +179,13 @@ function buildChecklistPdfDefinition(checklistId: string, checklist: any, title?
         }
 
         if (section?.weatherData) {
+            // Distinguish missing high-temp from a real 0°F reading — falsy
+            // coalescing with `|| 0` rendered "High 0°F" for any null/undefined.
+            const high = section.weatherData.highTemp;
+            const highText = typeof high === 'number' && Number.isFinite(high) ? `${high}°F` : 'N/A';
             content.push({
                 margin: [0, 0, 0, 8],
-                text: `Weather: High ${section.weatherData.highTemp || 0}°F · Shade Ready: ${section.weatherData.shadeReady ? 'Yes' : 'No'} · Buddy System: ${section.weatherData.buddySystemOn ? 'Yes' : 'No'}`,
+                text: `Weather: High ${highText} · Shade Ready: ${section.weatherData.shadeReady ? 'Yes' : 'No'} · Buddy System: ${section.weatherData.buddySystemOn ? 'Yes' : 'No'}`,
             });
         }
     });
@@ -290,9 +314,13 @@ function getMonthRange(month?: string) {
         };
     }
 
+    // Use UTC consistently — the explicit-month branch above uses Date.UTC,
+    // and toISOString() always emits UTC. Mixing local-time constructors with
+    // toISOString() can drift across month boundaries when this runs from a
+    // non-UTC server.
     const now = new Date();
-    const start = new Date(now.getFullYear(), now.getMonth() - 1, 1);
-    const end = new Date(now.getFullYear(), now.getMonth(), 1);
+    const start = new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth() - 1, 1));
+    const end = new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), 1));
     return {
         month: start.toISOString().slice(0, 7),
         start: start.toISOString().slice(0, 10),
@@ -464,17 +492,17 @@ export const onChecklistSubmissionAlert = functions
         const phase = isDayCompletion ? 'End of Day' : 'Morning Inspection';
 
         const notesHtml = itemsWithNotes.map((item) => `
-            <li><strong>${item.label}</strong><br />
-            Note: ${item.note}
-            ${item.photoUrls.length > 0 ? `<br />Photos: ${item.photoUrls.join(', ')}` : ''}</li>
+            <li><strong>${escapeHtml(item.label)}</strong><br />
+            Note: ${escapeHtml(item.note)}
+            ${item.photoUrls.length > 0 ? `<br />Photos: ${item.photoUrls.map(escapeHtml).join(', ')}` : ''}</li>
         `).join('');
 
         const hazardHtml = hazards.map((hazard: any) => `
-            <li><strong>${hazard.hazardFound || 'N/A'}</strong><br />
-            Location: ${hazard.location || 'N/A'} ·
+            <li><strong>${escapeHtml(hazard.hazardFound || 'N/A')}</strong><br />
+            Location: ${escapeHtml(hazard.location || 'N/A')} ·
             Fixed: ${hazard.fixed ? 'Yes' : '<strong style="color:red">No</strong>'}
-            ${hazard.correctiveAction ? `<br />Action: ${hazard.correctiveAction}` : ''}
-            ${(hazard.photoUrls || []).length > 0 ? `<br />Photos: ${hazard.photoUrls.join(', ')}` : ''}</li>
+            ${hazard.correctiveAction ? `<br />Action: ${escapeHtml(hazard.correctiveAction)}` : ''}
+            ${(hazard.photoUrls || []).length > 0 ? `<br />Photos: ${(hazard.photoUrls || []).map(escapeHtml).join(', ')}` : ''}</li>
         `).join('');
 
         const subjectParts = [];
@@ -484,20 +512,27 @@ export const onChecklistSubmissionAlert = functions
 
         const html = `
             <h2>Checklist Action Required</h2>
-            <p><strong>Truck:</strong> ${truckName}<br />
-            <strong>Submitted by:</strong> ${submittedBy}<br />
-            <strong>Phase:</strong> ${phase}<br />
-            <strong>Date:</strong> ${afterData.date || 'N/A'}</p>
+            <p><strong>Truck:</strong> ${escapeHtml(truckName)}<br />
+            <strong>Submitted by:</strong> ${escapeHtml(submittedBy)}<br />
+            <strong>Phase:</strong> ${escapeHtml(phase)}<br />
+            <strong>Date:</strong> ${escapeHtml(afterData.date || 'N/A')}</p>
             ${itemsWithNotes.length > 0 ? `<h3>Required Items with Notes</h3><ul>${notesHtml}</ul>` : ''}
             ${hazards.length > 0 ? `<h3>Hazards Reported</h3><ul>${hazardHtml}</ul>` : ''}
             <p><a href="${adminLink}">Open Admin Checklist View</a></p>
         `;
 
-        await sendEmail(
-            `Checklist: ${subjectParts.join(', ')} — ${truckName}`,
-            html,
-            { to: ['SuarezLawnServices.LLC@gmail.com'] }
-        );
+        // Don't let a transient SMTP failure bubble — the Firestore trigger
+        // would retry the entire function and resend the alert next time the
+        // checklist is updated. Log instead so we can investigate.
+        try {
+            await sendEmail(
+                `Checklist: ${subjectParts.join(', ')} — ${truckName}`,
+                html,
+                { to: ['SuarezLawnServices.LLC@gmail.com'] }
+            );
+        } catch (error) {
+            console.error('Error sending checklist submission alert email:', error);
+        }
 
         return null;
     });
@@ -572,14 +607,6 @@ export const monthlyChecklistReport = functions
         }
 
         const range = getMonthRange();
-        if (!result) {
-            await sendEmail(
-                `Monthly Checklist Report - ${range.label}`,
-                `<p>No checklists were recorded for ${range.label}.</p>`,
-                { to: ['SuarezLawnServices.LLC@gmail.com'] }
-            );
-            return null;
-        }
         const attachmentName = `monthly-checklists-${range.start}.pdf`;
 
         await sendEmail(
@@ -636,59 +663,67 @@ export const sendCompletionNotification = functions
             })
             : 'N/A';
 
+        // Render arrays as comma-joined strings; everything that comes from
+        // customer input is HTML-escaped before interpolation.
+        const renderField = (value: any): string => {
+            if (value == null || value === '') return 'N/A';
+            if (Array.isArray(value)) return escapeHtml(value.filter(Boolean).join(', ')) || 'N/A';
+            return escapeHtml(value);
+        };
+
         const messageBody = `
             <h2>New Service Request Created</h2>
             <p>A new service request has been created with the following details:</p>
             <table style="width: 100%; border-collapse: collapse;">
             <tr>
             <td style="padding: 8px; border: 1px solid #ddd;"><strong>Request ID:</strong></td>
-            <td style="padding: 8px; border: 1px solid #ddd;">${requestId}</td>
+            <td style="padding: 8px; border: 1px solid #ddd;">${escapeHtml(requestId)}</td>
             </tr>
             <tr>
             <td style="padding: 8px; border: 1px solid #ddd;"><strong>Name:</strong></td>
-            <td style="padding: 8px; border: 1px solid #ddd;">${customerName}</td>
+            <td style="padding: 8px; border: 1px solid #ddd;">${escapeHtml(customerName)}</td>
             </tr>
             <tr>
             <td style="padding: 8px; border: 1px solid #ddd;"><strong>Phone Number:</strong></td>
-            <td style="padding: 8px; border: 1px solid #ddd;">${newValue.phoneNumber ? newValue.phoneNumber : 'N/A'}</td>
+            <td style="padding: 8px; border: 1px solid #ddd;">${renderField(newValue.phoneNumber)}</td>
             </tr>
             <tr>
             <td style="padding: 8px; border: 1px solid #ddd;"><strong>Service Type:</strong></td>
-            <td style="padding: 8px; border: 1px solid #ddd;">${serviceType}</td>
+            <td style="padding: 8px; border: 1px solid #ddd;">${escapeHtml(serviceType)}</td>
             </tr>
             <tr>
             <td style="padding: 8px; border: 1px solid #ddd;"><strong>Time:</strong></td>
-            <td style="padding: 8px; border: 1px solid #ddd;">${formattedTimestamp}</td>
+            <td style="padding: 8px; border: 1px solid #ddd;">${escapeHtml(formattedTimestamp)}</td>
             </tr>
             <tr>
             <td style="padding: 8px; border: 1px solid #ddd;"><strong>Address:</strong></td>
-            <td style="padding: 8px; border: 1px solid #ddd;">${newValue.address ? newValue.address : 'N/A'}</td>
+            <td style="padding: 8px; border: 1px solid #ddd;">${renderField(newValue.address)}</td>
             </tr>
             <tr>
             <td style="padding: 8px; border: 1px solid #ddd;"><strong>Recurring Info:</strong></td>
-            <td style="padding: 8px; border: 1px solid #ddd;">${newValue.recurringServices ? newValue.recurringServices : 'N/A'}</td>
+            <td style="padding: 8px; border: 1px solid #ddd;">${renderField(newValue.recurringServices)}</td>
             </tr>
             <tr>
             <td style="padding: 8px; border: 1px solid #ddd;"><strong>One Time Services Wanted:</strong></td>
-            <td style="padding: 8px; border: 1px solid #ddd;">${newValue.oneTimeServices ? newValue.oneTimeServices : 'N/A'}</td>
+            <td style="padding: 8px; border: 1px solid #ddd;">${renderField(newValue.oneTimeServices)}</td>
             </tr>
             <tr>
             <td style="padding: 8px; border: 1px solid #ddd;"><strong>Landscape Services Wanted:</strong></td>
-            <td style="padding: 8px; border: 1px solid #ddd;">${newValue.landscapingServices ? newValue.landscapingServices : 'N/A'}</td>
+            <td style="padding: 8px; border: 1px solid #ddd;">${renderField(newValue.landscapingServices)}</td>
             </tr>
             <tr>
             <td style="padding: 8px; border: 1px solid #ddd;"><strong>Optional Details:</strong></td>
-            <td style="padding: 8px; border: 1px solid #ddd;">${newValue.optionalDetails ? newValue.optionalDetails : 'N/A'}</td>
+            <td style="padding: 8px; border: 1px solid #ddd;">${renderField(newValue.optionalDetails)}</td>
             </tr>
             <tr>
             <td style="padding: 8px; border: 1px solid #ddd;"><strong>Additional Details:</strong></td>
-            <td style="padding: 8px; border: 1px solid #ddd;">${newValue.additionalInfo ? newValue.additionalInfo : 'N/A'}</td>
+            <td style="padding: 8px; border: 1px solid #ddd;">${renderField(newValue.additionalInfo)}</td>
             </tr>
-            
+
             ${customerEmail !== 'N/A' ? `
             <tr>
             <td style="padding: 8px; border: 1px solid #ddd;"><strong>Customer Email:</strong></td>
-            <td style="padding: 8px; border: 1px solid #ddd;">${customerEmail}</td>
+            <td style="padding: 8px; border: 1px solid #ddd;">${escapeHtml(customerEmail)}</td>
             </tr>
             ` : ''}
             </table>
@@ -707,6 +742,10 @@ export const sendCompletionNotification = functions
 
         const smsLines: string[] = [];
         smsLines.push('SLS: New service request!!!');
+        // Link sits on line 2 — recurringServices items could push everything
+        // else past the 1000-char truncation cap below, and we MUST preserve
+        // the link so the team can open the request.
+        smsLines.push(`https://www.suarezlawnservices.com/service-request/${requestId}`);
         smsLines.push('');
         if (formattedTimestamp !== 'N/A') smsLines.push(`Time: ${formattedTimestamp}`);
         smsLines.push(`Name: ${customerName}`);
@@ -728,8 +767,6 @@ export const sendCompletionNotification = functions
         if (String(newValue.oneTimeServices || '').length > 0) smsLines.push(`One-time: ${newValue.oneTimeServices}`);
         if (String(newValue.landscapingServices || '').length > 0) smsLines.push(`Landscape: ${newValue.landscapingServices}`);
         smsLines.push('');
-        // Link goes BEFORE the free-text details so it survives any truncation.
-        smsLines.push(`https://www.suarezlawnservices.com/service-request/${requestId}`);
         if (customerEmail !== 'N/A') smsLines.push(`Email: ${customerEmail}`);
         if (newValue.optionalDetails) smsLines.push(`Optional: ${truncateForSms(newValue.optionalDetails, 200)}`);
         if (newValue.additionalInfo) smsLines.push(`Additional: ${truncateForSms(newValue.additionalInfo, 200)}`);
@@ -821,36 +858,52 @@ export const twilioSmsStatus = functions
             }
 
             const docRef = admin.firestore().collection('serviceRequests').doc(requestId);
-            const snap = await docRef.get();
-            if (!snap.exists) {
+
+            // Read-modify-write inside a transaction so concurrent callbacks
+            // for the same SID don't both observe `prevStatus === undefined`
+            // and both fire the failure-alert email below.
+            const txnResult = await admin.firestore().runTransaction(async (txn) => {
+                const snap = await txn.get(docRef);
+                if (!snap.exists) {
+                    return { kind: 'missing' as const };
+                }
+                const data = snap.data() || {};
+                const knownSids: string[] = data.notifications?.sms?.sids || [];
+                if (!knownSids.includes(messageSid)) {
+                    return { kind: 'unknown-sid' as const };
+                }
+                const prevStatus: string | undefined =
+                    data.notifications?.sms?.delivery?.[messageSid]?.status;
+
+                txn.set(docRef, {
+                    notifications: {
+                        sms: {
+                            delivery: {
+                                [messageSid]: {
+                                    to,
+                                    status: messageStatus,
+                                    errorCode,
+                                    at: admin.firestore.FieldValue.serverTimestamp(),
+                                },
+                            },
+                        },
+                    },
+                }, { merge: true });
+
+                return { kind: 'ok' as const, prevStatus, data };
+            });
+
+            if (txnResult.kind === 'missing') {
                 res.status(404).send('Unknown request');
                 return;
             }
-            const data = snap.data() || {};
-            const knownSids: string[] = data.notifications?.sms?.sids || [];
-            if (!knownSids.includes(messageSid)) {
+            if (txnResult.kind === 'unknown-sid') {
                 console.error(`SID ${messageSid} not registered on request ${requestId}`);
                 res.status(403).send('Unknown message SID');
                 return;
             }
 
-            const prevStatus: string | undefined =
-                data.notifications?.sms?.delivery?.[messageSid]?.status;
-
-            await docRef.set({
-                notifications: {
-                    sms: {
-                        delivery: {
-                            [messageSid]: {
-                                to,
-                                status: messageStatus,
-                                errorCode,
-                                at: admin.firestore.FieldValue.serverTimestamp(),
-                            },
-                        },
-                    },
-                },
-            }, { merge: true });
+            const { prevStatus, data } = txnResult;
 
             // Terminal failure → alert the team by email (a different failure
             // domain than SMS). Guard against duplicate callbacks for the same
@@ -862,10 +915,10 @@ export const twilioSmsStatus = functions
                 try {
                     await sendEmail(
                         `⚠️ SMS notification FAILED — service request ${requestId}`,
-                        `<p>The new-service-request SMS to <strong>${name}</strong> (${to}) was ` +
-                        `<strong>${messageStatus}</strong>${errorCode ? ` (Twilio error ${errorCode})` : ''}.</p>` +
-                        `<p>Customer: ${data.fullName || 'N/A'} — ${data.phoneNumber || 'N/A'}</p>` +
-                        `<p><a href="https://www.suarezlawnservices.com/service-request/${requestId}">View the request</a> ` +
+                        `<p>The new-service-request SMS to <strong>${escapeHtml(name)}</strong> (${escapeHtml(to)}) was ` +
+                        `<strong>${escapeHtml(messageStatus)}</strong>${errorCode ? ` (Twilio error ${escapeHtml(errorCode)})` : ''}.</p>` +
+                        `<p>Customer: ${escapeHtml(data.fullName || 'N/A')} — ${escapeHtml(data.phoneNumber || 'N/A')}</p>` +
+                        `<p><a href="https://www.suarezlawnservices.com/service-request/${encodeURIComponent(requestId)}">View the request</a> ` +
                         `so it doesn't get missed.</p>`
                     );
                 } catch (error) {
@@ -911,26 +964,28 @@ export const sendNewSubscriptionNotification = functions
         const referredByCode = data.referredByCode || null;
         const adminLink = `https://www.suarezlawnservices.com/admin/subscriptions/${subId}`;
 
-        // HTML email
+        // HTML email — every customer-supplied field is escaped before
+        // embedding. formatPlanType/formatPrice/capitalize/adminLink come from
+        // trusted internal sources so they pass through untouched.
         const emailHtml = `
             <h2>New Subscription</h2>
             <p>A new customer has subscribed to lawn services:</p>
             <table style="width: 100%; border-collapse: collapse;">
             <tr>
                 <td style="padding: 8px; border: 1px solid #ddd;"><strong>Customer:</strong></td>
-                <td style="padding: 8px; border: 1px solid #ddd;">${customerName}</td>
+                <td style="padding: 8px; border: 1px solid #ddd;">${escapeHtml(customerName)}</td>
             </tr>
             <tr>
                 <td style="padding: 8px; border: 1px solid #ddd;"><strong>Phone:</strong></td>
-                <td style="padding: 8px; border: 1px solid #ddd;">${customerPhone}</td>
+                <td style="padding: 8px; border: 1px solid #ddd;">${escapeHtml(customerPhone)}</td>
             </tr>
             <tr>
                 <td style="padding: 8px; border: 1px solid #ddd;"><strong>Email:</strong></td>
-                <td style="padding: 8px; border: 1px solid #ddd;">${customerEmail}</td>
+                <td style="padding: 8px; border: 1px solid #ddd;">${escapeHtml(customerEmail)}</td>
             </tr>
             <tr>
                 <td style="padding: 8px; border: 1px solid #ddd;"><strong>Address:</strong></td>
-                <td style="padding: 8px; border: 1px solid #ddd;">${address}</td>
+                <td style="padding: 8px; border: 1px solid #ddd;">${escapeHtml(address)}</td>
             </tr>
             <tr>
                 <td style="padding: 8px; border: 1px solid #ddd;"><strong>Plan:</strong></td>
@@ -946,11 +1001,11 @@ export const sendNewSubscriptionNotification = functions
             </tr>
             <tr>
                 <td style="padding: 8px; border: 1px solid #ddd;"><strong>First Service Date:</strong></td>
-                <td style="padding: 8px; border: 1px solid #ddd;">${nextServiceDate}</td>
+                <td style="padding: 8px; border: 1px solid #ddd;">${escapeHtml(nextServiceDate)}</td>
             </tr>
             <tr>
                 <td style="padding: 8px; border: 1px solid #ddd;"><strong>Zone:</strong></td>
-                <td style="padding: 8px; border: 1px solid #ddd;">${zoneName}</td>
+                <td style="padding: 8px; border: 1px solid #ddd;">${escapeHtml(zoneName)}</td>
             </tr>
             <tr>
                 <td style="padding: 8px; border: 1px solid #ddd;"><strong>Department:</strong></td>
@@ -959,7 +1014,7 @@ export const sendNewSubscriptionNotification = functions
             ${referredByCode ? `
             <tr>
                 <td style="padding: 8px; border: 1px solid #ddd;"><strong>Referred By:</strong></td>
-                <td style="padding: 8px; border: 1px solid #ddd;">${referredByCode}</td>
+                <td style="padding: 8px; border: 1px solid #ddd;">${escapeHtml(referredByCode)}</td>
             </tr>
             ` : ''}
             </table>
@@ -1043,7 +1098,7 @@ export const sendPaymentReceivedNotification = functions
             <table style="width: 100%; border-collapse: collapse;">
             <tr>
                 <td style="padding: 8px; border: 1px solid #ddd;"><strong>Customer:</strong></td>
-                <td style="padding: 8px; border: 1px solid #ddd;">${customerName}</td>
+                <td style="padding: 8px; border: 1px solid #ddd;">${escapeHtml(customerName)}</td>
             </tr>
             <tr>
                 <td style="padding: 8px; border: 1px solid #ddd;"><strong>Amount:</strong></td>
@@ -1055,11 +1110,11 @@ export const sendPaymentReceivedNotification = functions
             </tr>
             <tr>
                 <td style="padding: 8px; border: 1px solid #ddd;"><strong>Invoice ID:</strong></td>
-                <td style="padding: 8px; border: 1px solid #ddd;">${invoiceId}</td>
+                <td style="padding: 8px; border: 1px solid #ddd;">${escapeHtml(invoiceId)}</td>
             </tr>
             <tr>
                 <td style="padding: 8px; border: 1px solid #ddd;"><strong>Status:</strong></td>
-                <td style="padding: 8px; border: 1px solid #ddd;">${subscriptionStatus}</td>
+                <td style="padding: 8px; border: 1px solid #ddd;">${escapeHtml(subscriptionStatus)}</td>
             </tr>
             </table>
             <p><a href="${adminLink}">View in Admin Panel</a></p>
@@ -1109,6 +1164,10 @@ export const onSubscriptionStatusChange = functions
         const afterData = change.after.data();
         const subId = context.params.subId;
 
+        // Mirrors the guard in onChecklistSubmissionAlert — defensive against
+        // the rare case where snapshot data is missing.
+        if (!beforeData || !afterData) return null;
+
         const beforeStatus = beforeData.status;
         const afterStatus = afterData.status;
 
@@ -1145,15 +1204,15 @@ async function notifyPaymentFailed(
         <table style="width: 100%; border-collapse: collapse;">
         <tr>
             <td style="padding: 8px; border: 1px solid #ddd;"><strong>Customer:</strong></td>
-            <td style="padding: 8px; border: 1px solid #ddd;">${customerName}</td>
+            <td style="padding: 8px; border: 1px solid #ddd;">${escapeHtml(customerName)}</td>
         </tr>
         <tr>
             <td style="padding: 8px; border: 1px solid #ddd;"><strong>Phone:</strong></td>
-            <td style="padding: 8px; border: 1px solid #ddd;">${customerPhone}</td>
+            <td style="padding: 8px; border: 1px solid #ddd;">${escapeHtml(customerPhone)}</td>
         </tr>
         <tr>
             <td style="padding: 8px; border: 1px solid #ddd;"><strong>Address:</strong></td>
-            <td style="padding: 8px; border: 1px solid #ddd;">${address}</td>
+            <td style="padding: 8px; border: 1px solid #ddd;">${escapeHtml(address)}</td>
         </tr>
         <tr>
             <td style="padding: 8px; border: 1px solid #ddd;"><strong>Plan:</strong></td>
@@ -1211,7 +1270,7 @@ async function notifyCancellation(
         <table style="width: 100%; border-collapse: collapse;">
         <tr>
             <td style="padding: 8px; border: 1px solid #ddd;"><strong>Customer:</strong></td>
-            <td style="padding: 8px; border: 1px solid #ddd;">${customerName}</td>
+            <td style="padding: 8px; border: 1px solid #ddd;">${escapeHtml(customerName)}</td>
         </tr>
         <tr>
             <td style="padding: 8px; border: 1px solid #ddd;"><strong>Plan:</strong></td>
@@ -1223,7 +1282,7 @@ async function notifyCancellation(
         </tr>
         <tr>
             <td style="padding: 8px; border: 1px solid #ddd;"><strong>Canceled At:</strong></td>
-            <td style="padding: 8px; border: 1px solid #ddd;">${canceledAt}</td>
+            <td style="padding: 8px; border: 1px solid #ddd;">${escapeHtml(canceledAt)}</td>
         </tr>
         </table>
         <p><a href="${adminLink}">View in Admin Panel</a></p>
