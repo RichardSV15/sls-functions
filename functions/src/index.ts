@@ -27,14 +27,16 @@ const gmailUser = "RichardSV15@gmail.com";
 // self-/peer-sent Gmail unpredictably).
 const recipientEmails = ['RichardSV15@gmail.com', 'DanielSV17@gmail.com', 'SuarezLawnServices.LLC@gmail.com'];
 
-// Recipient phone numbers
-const recipientPhoneNumbers = ['+15595675330', '+15595677354', '+15592136764'];
-// Map of team member phone numbers to names
+// Recipient phone numbers — get notification SMS blasts AND relayed team
+// replies (see handleIncomingSms). +15598091230 is the RS Office line.
+const recipientPhoneNumbers = ['+15595675330', '+15595677354', '+15592136764', '+15598091230'];
+// Map of team member phone numbers to names — recognized senders for the relay
 const teamMembers: { [phoneNumber: string]: string } = {
     '+15595675330': 'Richard',
     '+15595677354': 'Daniel',
     '+15592136764': 'Julia',
-    '+15592419140': 'Inocencio'
+    '+15592419140': 'Inocencio',
+    '+15598091230': 'RS Office'
 };
 
 
