@@ -63,6 +63,7 @@ function formatPrice(cents: number): string {
 function formatDate(dateValue: any): string {
     if (!dateValue) return 'N/A';
     const date = dateValue.toDate ? dateValue.toDate() : new Date(dateValue);
+    if (!(date instanceof Date) || Number.isNaN(date.getTime())) return 'N/A';
     return date.toLocaleString('en-US', {
         timeZone: 'America/Los_Angeles',
         month: 'long',
@@ -75,6 +76,32 @@ function formatDate(dateValue: any): string {
 function capitalize(str: string): string {
     if (!str) return str;
     return str.charAt(0).toUpperCase() + str.slice(1);
+}
+
+/**
+ * Escape user-controlled values for safe interpolation into HTML email bodies.
+ * Customer free-text (names, addresses, "additional info" notes, hazard
+ * descriptions, etc.) lands in our internal email; without escaping, a `<`
+ * breaks layout and `<script>` would be a real XSS.
+ */
+function escapeHtml(value: any): string {
+    if (value === null || value === undefined) return '';
+    return String(value)
+        .replace(/&/g, '&amp;')
+        .replace(/</g, '&lt;')
+        .replace(/>/g, '&gt;')
+        .replace(/"/g, '&quot;')
+        .replace(/'/g, '&#39;');
+}
+
+/**
+ * Restrict path segments used in Cloud Storage object names to safe chars.
+ * Filters like department or truckId come from request bodies and are joined
+ * into a path with `/`; without this, `..` or `/` would let a caller write
+ * outside the intended report folder.
+ */
+function sanitizePathPart(part: string): string {
+    return String(part).replace(/[^a-zA-Z0-9_-]/g, '_');
 }
 
 
@@ -392,9 +419,12 @@ async function generateMonthlyChecklistReportFile(filters: { month?: string; dep
     };
 
     const pdfBuffer = await createPdfBuffer(summaryDefinition);
+    // range.month is regex-validated ("YYYY-MM"); filters come from request
+    // bodies and need to be reduced to safe path chars so a value like
+    // "../prod/secret" cannot escape the reports/checklists/monthly tree.
     const pathParts = ['reports', 'checklists', 'monthly', range.month];
-    if (filters.department) pathParts.push(filters.department);
-    if (filters.truckId) pathParts.push(filters.truckId);
+    if (filters.department) pathParts.push(sanitizePathPart(filters.department));
+    if (filters.truckId) pathParts.push(sanitizePathPart(filters.truckId));
     const storagePath = `${pathParts.join('/')}.pdf`;
     const pdfUrl = await uploadPdfBuffer(storagePath, pdfBuffer);
 
@@ -459,22 +489,25 @@ export const onChecklistSubmissionAlert = functions
         const checklistId = context.params.checklistId;
         const adminLink = `https://www.suarezlawnservices.com/admin/checklists`;
         const truckName = afterData.truckDisplayName || afterData.truckId || checklistId;
-        const submittedBy = afterData.morningCompletedByName || afterData.completedByName
+        // Attribute to the person who completed THIS phase. The previous
+        // `morning || completed` chain always attributed EOD submissions to
+        // the morning person.
+        const submittedBy = (isDayCompletion ? afterData.completedByName : afterData.morningCompletedByName)
             || afterData.signature?.employeeName || 'Field employee';
         const phase = isDayCompletion ? 'End of Day' : 'Morning Inspection';
 
         const notesHtml = itemsWithNotes.map((item) => `
-            <li><strong>${item.label}</strong><br />
-            Note: ${item.note}
-            ${item.photoUrls.length > 0 ? `<br />Photos: ${item.photoUrls.join(', ')}` : ''}</li>
+            <li><strong>${escapeHtml(item.label)}</strong><br />
+            Note: ${escapeHtml(item.note)}
+            ${item.photoUrls.length > 0 ? `<br />Photos: ${item.photoUrls.map(escapeHtml).join(', ')}` : ''}</li>
         `).join('');
 
         const hazardHtml = hazards.map((hazard: any) => `
-            <li><strong>${hazard.hazardFound || 'N/A'}</strong><br />
-            Location: ${hazard.location || 'N/A'} ·
+            <li><strong>${escapeHtml(hazard.hazardFound || 'N/A')}</strong><br />
+            Location: ${escapeHtml(hazard.location || 'N/A')} ·
             Fixed: ${hazard.fixed ? 'Yes' : '<strong style="color:red">No</strong>'}
-            ${hazard.correctiveAction ? `<br />Action: ${hazard.correctiveAction}` : ''}
-            ${(hazard.photoUrls || []).length > 0 ? `<br />Photos: ${hazard.photoUrls.join(', ')}` : ''}</li>
+            ${hazard.correctiveAction ? `<br />Action: ${escapeHtml(hazard.correctiveAction)}` : ''}
+            ${(hazard.photoUrls || []).length > 0 ? `<br />Photos: ${(hazard.photoUrls as any[]).map(escapeHtml).join(', ')}` : ''}</li>
         `).join('');
 
         const subjectParts = [];
@@ -484,10 +517,10 @@ export const onChecklistSubmissionAlert = functions
 
         const html = `
             <h2>Checklist Action Required</h2>
-            <p><strong>Truck:</strong> ${truckName}<br />
-            <strong>Submitted by:</strong> ${submittedBy}<br />
-            <strong>Phase:</strong> ${phase}<br />
-            <strong>Date:</strong> ${afterData.date || 'N/A'}</p>
+            <p><strong>Truck:</strong> ${escapeHtml(truckName)}<br />
+            <strong>Submitted by:</strong> ${escapeHtml(submittedBy)}<br />
+            <strong>Phase:</strong> ${escapeHtml(phase)}<br />
+            <strong>Date:</strong> ${escapeHtml(afterData.date || 'N/A')}</p>
             ${itemsWithNotes.length > 0 ? `<h3>Required Items with Notes</h3><ul>${notesHtml}</ul>` : ''}
             ${hazards.length > 0 ? `<h3>Hazards Reported</h3><ul>${hazardHtml}</ul>` : ''}
             <p><a href="${adminLink}">Open Admin Checklist View</a></p>
@@ -642,53 +675,53 @@ export const sendCompletionNotification = functions
             <table style="width: 100%; border-collapse: collapse;">
             <tr>
             <td style="padding: 8px; border: 1px solid #ddd;"><strong>Request ID:</strong></td>
-            <td style="padding: 8px; border: 1px solid #ddd;">${requestId}</td>
+            <td style="padding: 8px; border: 1px solid #ddd;">${escapeHtml(requestId)}</td>
             </tr>
             <tr>
             <td style="padding: 8px; border: 1px solid #ddd;"><strong>Name:</strong></td>
-            <td style="padding: 8px; border: 1px solid #ddd;">${customerName}</td>
+            <td style="padding: 8px; border: 1px solid #ddd;">${escapeHtml(customerName)}</td>
             </tr>
             <tr>
             <td style="padding: 8px; border: 1px solid #ddd;"><strong>Phone Number:</strong></td>
-            <td style="padding: 8px; border: 1px solid #ddd;">${newValue.phoneNumber ? newValue.phoneNumber : 'N/A'}</td>
+            <td style="padding: 8px; border: 1px solid #ddd;">${escapeHtml(newValue.phoneNumber || 'N/A')}</td>
             </tr>
             <tr>
             <td style="padding: 8px; border: 1px solid #ddd;"><strong>Service Type:</strong></td>
-            <td style="padding: 8px; border: 1px solid #ddd;">${serviceType}</td>
+            <td style="padding: 8px; border: 1px solid #ddd;">${escapeHtml(serviceType)}</td>
             </tr>
             <tr>
             <td style="padding: 8px; border: 1px solid #ddd;"><strong>Time:</strong></td>
-            <td style="padding: 8px; border: 1px solid #ddd;">${formattedTimestamp}</td>
+            <td style="padding: 8px; border: 1px solid #ddd;">${escapeHtml(formattedTimestamp)}</td>
             </tr>
             <tr>
             <td style="padding: 8px; border: 1px solid #ddd;"><strong>Address:</strong></td>
-            <td style="padding: 8px; border: 1px solid #ddd;">${newValue.address ? newValue.address : 'N/A'}</td>
+            <td style="padding: 8px; border: 1px solid #ddd;">${escapeHtml(newValue.address || 'N/A')}</td>
             </tr>
             <tr>
             <td style="padding: 8px; border: 1px solid #ddd;"><strong>Recurring Info:</strong></td>
-            <td style="padding: 8px; border: 1px solid #ddd;">${newValue.recurringServices ? newValue.recurringServices : 'N/A'}</td>
+            <td style="padding: 8px; border: 1px solid #ddd;">${escapeHtml(Array.isArray(newValue.recurringServices) ? newValue.recurringServices.join(', ') : (newValue.recurringServices || 'N/A'))}</td>
             </tr>
             <tr>
             <td style="padding: 8px; border: 1px solid #ddd;"><strong>One Time Services Wanted:</strong></td>
-            <td style="padding: 8px; border: 1px solid #ddd;">${newValue.oneTimeServices ? newValue.oneTimeServices : 'N/A'}</td>
+            <td style="padding: 8px; border: 1px solid #ddd;">${escapeHtml(Array.isArray(newValue.oneTimeServices) ? newValue.oneTimeServices.join(', ') : (newValue.oneTimeServices || 'N/A'))}</td>
             </tr>
             <tr>
             <td style="padding: 8px; border: 1px solid #ddd;"><strong>Landscape Services Wanted:</strong></td>
-            <td style="padding: 8px; border: 1px solid #ddd;">${newValue.landscapingServices ? newValue.landscapingServices : 'N/A'}</td>
+            <td style="padding: 8px; border: 1px solid #ddd;">${escapeHtml(Array.isArray(newValue.landscapingServices) ? newValue.landscapingServices.join(', ') : (newValue.landscapingServices || 'N/A'))}</td>
             </tr>
             <tr>
             <td style="padding: 8px; border: 1px solid #ddd;"><strong>Optional Details:</strong></td>
-            <td style="padding: 8px; border: 1px solid #ddd;">${newValue.optionalDetails ? newValue.optionalDetails : 'N/A'}</td>
+            <td style="padding: 8px; border: 1px solid #ddd;">${escapeHtml(newValue.optionalDetails || 'N/A')}</td>
             </tr>
             <tr>
             <td style="padding: 8px; border: 1px solid #ddd;"><strong>Additional Details:</strong></td>
-            <td style="padding: 8px; border: 1px solid #ddd;">${newValue.additionalInfo ? newValue.additionalInfo : 'N/A'}</td>
+            <td style="padding: 8px; border: 1px solid #ddd;">${escapeHtml(newValue.additionalInfo || 'N/A')}</td>
             </tr>
-            
+
             ${customerEmail !== 'N/A' ? `
             <tr>
             <td style="padding: 8px; border: 1px solid #ddd;"><strong>Customer Email:</strong></td>
-            <td style="padding: 8px; border: 1px solid #ddd;">${customerEmail}</td>
+            <td style="padding: 8px; border: 1px solid #ddd;">${escapeHtml(customerEmail)}</td>
             </tr>
             ` : ''}
             </table>
@@ -862,10 +895,10 @@ export const twilioSmsStatus = functions
                 try {
                     await sendEmail(
                         `⚠️ SMS notification FAILED — service request ${requestId}`,
-                        `<p>The new-service-request SMS to <strong>${name}</strong> (${to}) was ` +
-                        `<strong>${messageStatus}</strong>${errorCode ? ` (Twilio error ${errorCode})` : ''}.</p>` +
-                        `<p>Customer: ${data.fullName || 'N/A'} — ${data.phoneNumber || 'N/A'}</p>` +
-                        `<p><a href="https://www.suarezlawnservices.com/service-request/${requestId}">View the request</a> ` +
+                        `<p>The new-service-request SMS to <strong>${escapeHtml(name)}</strong> (${escapeHtml(to)}) was ` +
+                        `<strong>${escapeHtml(messageStatus)}</strong>${errorCode ? ` (Twilio error ${escapeHtml(errorCode)})` : ''}.</p>` +
+                        `<p>Customer: ${escapeHtml(data.fullName || 'N/A')} — ${escapeHtml(data.phoneNumber || 'N/A')}</p>` +
+                        `<p><a href="https://www.suarezlawnservices.com/service-request/${encodeURIComponent(requestId)}">View the request</a> ` +
                         `so it doesn't get missed.</p>`
                     );
                 } catch (error) {
@@ -918,23 +951,23 @@ export const sendNewSubscriptionNotification = functions
             <table style="width: 100%; border-collapse: collapse;">
             <tr>
                 <td style="padding: 8px; border: 1px solid #ddd;"><strong>Customer:</strong></td>
-                <td style="padding: 8px; border: 1px solid #ddd;">${customerName}</td>
+                <td style="padding: 8px; border: 1px solid #ddd;">${escapeHtml(customerName)}</td>
             </tr>
             <tr>
                 <td style="padding: 8px; border: 1px solid #ddd;"><strong>Phone:</strong></td>
-                <td style="padding: 8px; border: 1px solid #ddd;">${customerPhone}</td>
+                <td style="padding: 8px; border: 1px solid #ddd;">${escapeHtml(customerPhone)}</td>
             </tr>
             <tr>
                 <td style="padding: 8px; border: 1px solid #ddd;"><strong>Email:</strong></td>
-                <td style="padding: 8px; border: 1px solid #ddd;">${customerEmail}</td>
+                <td style="padding: 8px; border: 1px solid #ddd;">${escapeHtml(customerEmail)}</td>
             </tr>
             <tr>
                 <td style="padding: 8px; border: 1px solid #ddd;"><strong>Address:</strong></td>
-                <td style="padding: 8px; border: 1px solid #ddd;">${address}</td>
+                <td style="padding: 8px; border: 1px solid #ddd;">${escapeHtml(address)}</td>
             </tr>
             <tr>
                 <td style="padding: 8px; border: 1px solid #ddd;"><strong>Plan:</strong></td>
-                <td style="padding: 8px; border: 1px solid #ddd;">${formatPlanType(planType)}</td>
+                <td style="padding: 8px; border: 1px solid #ddd;">${escapeHtml(formatPlanType(planType))}</td>
             </tr>
             <tr>
                 <td style="padding: 8px; border: 1px solid #ddd;"><strong>Price:</strong></td>
@@ -942,24 +975,24 @@ export const sendNewSubscriptionNotification = functions
             </tr>
             <tr>
                 <td style="padding: 8px; border: 1px solid #ddd;"><strong>Service Day:</strong></td>
-                <td style="padding: 8px; border: 1px solid #ddd;">${capitalize(serviceDay)}</td>
+                <td style="padding: 8px; border: 1px solid #ddd;">${escapeHtml(capitalize(serviceDay))}</td>
             </tr>
             <tr>
                 <td style="padding: 8px; border: 1px solid #ddd;"><strong>First Service Date:</strong></td>
-                <td style="padding: 8px; border: 1px solid #ddd;">${nextServiceDate}</td>
+                <td style="padding: 8px; border: 1px solid #ddd;">${escapeHtml(nextServiceDate)}</td>
             </tr>
             <tr>
                 <td style="padding: 8px; border: 1px solid #ddd;"><strong>Zone:</strong></td>
-                <td style="padding: 8px; border: 1px solid #ddd;">${zoneName}</td>
+                <td style="padding: 8px; border: 1px solid #ddd;">${escapeHtml(zoneName)}</td>
             </tr>
             <tr>
                 <td style="padding: 8px; border: 1px solid #ddd;"><strong>Department:</strong></td>
-                <td style="padding: 8px; border: 1px solid #ddd;">${capitalize(department)}</td>
+                <td style="padding: 8px; border: 1px solid #ddd;">${escapeHtml(capitalize(department))}</td>
             </tr>
             ${referredByCode ? `
             <tr>
                 <td style="padding: 8px; border: 1px solid #ddd;"><strong>Referred By:</strong></td>
-                <td style="padding: 8px; border: 1px solid #ddd;">${referredByCode}</td>
+                <td style="padding: 8px; border: 1px solid #ddd;">${escapeHtml(referredByCode)}</td>
             </tr>
             ` : ''}
             </table>
@@ -1043,7 +1076,7 @@ export const sendPaymentReceivedNotification = functions
             <table style="width: 100%; border-collapse: collapse;">
             <tr>
                 <td style="padding: 8px; border: 1px solid #ddd;"><strong>Customer:</strong></td>
-                <td style="padding: 8px; border: 1px solid #ddd;">${customerName}</td>
+                <td style="padding: 8px; border: 1px solid #ddd;">${escapeHtml(customerName)}</td>
             </tr>
             <tr>
                 <td style="padding: 8px; border: 1px solid #ddd;"><strong>Amount:</strong></td>
@@ -1051,15 +1084,15 @@ export const sendPaymentReceivedNotification = functions
             </tr>
             <tr>
                 <td style="padding: 8px; border: 1px solid #ddd;"><strong>Plan:</strong></td>
-                <td style="padding: 8px; border: 1px solid #ddd;">${formatPlanType(planType)}</td>
+                <td style="padding: 8px; border: 1px solid #ddd;">${escapeHtml(formatPlanType(planType))}</td>
             </tr>
             <tr>
                 <td style="padding: 8px; border: 1px solid #ddd;"><strong>Invoice ID:</strong></td>
-                <td style="padding: 8px; border: 1px solid #ddd;">${invoiceId}</td>
+                <td style="padding: 8px; border: 1px solid #ddd;">${escapeHtml(invoiceId)}</td>
             </tr>
             <tr>
                 <td style="padding: 8px; border: 1px solid #ddd;"><strong>Status:</strong></td>
-                <td style="padding: 8px; border: 1px solid #ddd;">${subscriptionStatus}</td>
+                <td style="padding: 8px; border: 1px solid #ddd;">${escapeHtml(subscriptionStatus)}</td>
             </tr>
             </table>
             <p><a href="${adminLink}">View in Admin Panel</a></p>
@@ -1145,19 +1178,19 @@ async function notifyPaymentFailed(
         <table style="width: 100%; border-collapse: collapse;">
         <tr>
             <td style="padding: 8px; border: 1px solid #ddd;"><strong>Customer:</strong></td>
-            <td style="padding: 8px; border: 1px solid #ddd;">${customerName}</td>
+            <td style="padding: 8px; border: 1px solid #ddd;">${escapeHtml(customerName)}</td>
         </tr>
         <tr>
             <td style="padding: 8px; border: 1px solid #ddd;"><strong>Phone:</strong></td>
-            <td style="padding: 8px; border: 1px solid #ddd;">${customerPhone}</td>
+            <td style="padding: 8px; border: 1px solid #ddd;">${escapeHtml(customerPhone)}</td>
         </tr>
         <tr>
             <td style="padding: 8px; border: 1px solid #ddd;"><strong>Address:</strong></td>
-            <td style="padding: 8px; border: 1px solid #ddd;">${address}</td>
+            <td style="padding: 8px; border: 1px solid #ddd;">${escapeHtml(address)}</td>
         </tr>
         <tr>
             <td style="padding: 8px; border: 1px solid #ddd;"><strong>Plan:</strong></td>
-            <td style="padding: 8px; border: 1px solid #ddd;">${formatPlanType(planType)}</td>
+            <td style="padding: 8px; border: 1px solid #ddd;">${escapeHtml(formatPlanType(planType))}</td>
         </tr>
         <tr>
             <td style="padding: 8px; border: 1px solid #ddd;"><strong>Price:</strong></td>
@@ -1211,11 +1244,11 @@ async function notifyCancellation(
         <table style="width: 100%; border-collapse: collapse;">
         <tr>
             <td style="padding: 8px; border: 1px solid #ddd;"><strong>Customer:</strong></td>
-            <td style="padding: 8px; border: 1px solid #ddd;">${customerName}</td>
+            <td style="padding: 8px; border: 1px solid #ddd;">${escapeHtml(customerName)}</td>
         </tr>
         <tr>
             <td style="padding: 8px; border: 1px solid #ddd;"><strong>Plan:</strong></td>
-            <td style="padding: 8px; border: 1px solid #ddd;">${formatPlanType(planType)}</td>
+            <td style="padding: 8px; border: 1px solid #ddd;">${escapeHtml(formatPlanType(planType))}</td>
         </tr>
         <tr>
             <td style="padding: 8px; border: 1px solid #ddd;"><strong>Price:</strong></td>
@@ -1223,7 +1256,7 @@ async function notifyCancellation(
         </tr>
         <tr>
             <td style="padding: 8px; border: 1px solid #ddd;"><strong>Canceled At:</strong></td>
-            <td style="padding: 8px; border: 1px solid #ddd;">${canceledAt}</td>
+            <td style="padding: 8px; border: 1px solid #ddd;">${escapeHtml(canceledAt)}</td>
         </tr>
         </table>
         <p><a href="${adminLink}">View in Admin Panel</a></p>
@@ -1322,19 +1355,32 @@ export const handleIncomingSms = functions
 
         try {
             const client = twilio(twilioSid.value(), twilioToken.value());
-            const sendSMSPromises = otherTeamMembers.map(async (phoneNumber) => {
-                console.log(`Sending message to ${phoneNumber}`);
-                await client.messages.create({
-                    body: messageToSend,
-                    from: twilioPhone.value(),
-                    to: phoneNumber
-                });
-            });
-
-            await Promise.all(sendSMSPromises);
-
-            console.log('Message forwarded to team members');
-            res.status(200).send('Message forwarded');
+            // allSettled so one bad number doesn't strand the rest of the
+            // team without the forwarded message.
+            const forwardResults = await Promise.allSettled(
+                otherTeamMembers.map((phoneNumber) => {
+                    console.log(`Sending message to ${phoneNumber}`);
+                    return client.messages.create({
+                        body: messageToSend,
+                        from: twilioPhone.value(),
+                        to: phoneNumber,
+                    });
+                })
+            );
+            const failed = forwardResults
+                .map((r, i) => ({ r, to: otherTeamMembers[i] }))
+                .filter(({ r }) => r.status === 'rejected');
+            failed.forEach(({ r, to }) =>
+                console.error(`Forward to ${to} failed:`, (r as PromiseRejectedResult).reason)
+            );
+            if (failed.length === forwardResults.length && forwardResults.length > 0) {
+                res.status(500).send('Error sending SMS');
+            } else {
+                console.log(
+                    `Message forwarded to ${forwardResults.length - failed.length}/${forwardResults.length} team members`
+                );
+                res.status(200).send('Message forwarded');
+            }
         } catch (error) {
             console.error('Error sending SMS:', error);
             res.status(500).send('Error sending SMS');
@@ -1431,7 +1477,10 @@ async function sendSMS(
 ): Promise<string[]> {
     const client = twilio(twilioSid.value(), twilioToken.value());
     const targets = options?.to || recipientPhoneNumbers;
-    const messages = await Promise.all(targets.map((phoneNumber) =>
+    // allSettled (not all) so one rejected send — e.g. a number that has
+    // gone inactive — doesn't discard the SIDs of the others. Without
+    // those SIDs we can't match Twilio status callbacks back to recipients.
+    const results = await Promise.allSettled(targets.map((phoneNumber) =>
         client.messages.create({
             body: body,
             from: twilioPhone.value(),
@@ -1439,5 +1488,16 @@ async function sendSMS(
             ...(options?.statusCallback ? { statusCallback: options.statusCallback } : {}),
         })
     ));
-    return messages.map((m) => m.sid);
+    const sids: string[] = [];
+    results.forEach((result, index) => {
+        if (result.status === 'fulfilled') {
+            sids.push(result.value.sid);
+        } else {
+            console.error(`SMS send to ${targets[index]} failed:`, result.reason);
+        }
+    });
+    if (sids.length === 0 && targets.length > 0) {
+        throw new Error('All SMS sends failed');
+    }
+    return sids;
 }
