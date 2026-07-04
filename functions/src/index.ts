@@ -1021,6 +1021,23 @@ export const sendPaymentReceivedNotification = functions
             return null;
         }
 
+        // Respect the admin "Payment Received" team-alert toggle
+        // (settings/notifications.paymentReceivedAlertEnabled, surfaced at
+        // /admin/notifications). Fail-open: if the doc is missing or unreadable,
+        // send anyway — the alert is the safe default.
+        try {
+            const settingsSnap = await admin.firestore()
+                .collection('settings')
+                .doc('notifications')
+                .get();
+            if (settingsSnap.exists && settingsSnap.data()?.paymentReceivedAlertEnabled === false) {
+                console.log('Payment-received team alert disabled via settings, skipping');
+                return null;
+            }
+        } catch (err) {
+            console.error('Could not read notification settings, defaulting to send:', err);
+        }
+
         // Fetch parent subscription for customer details
         const subDoc = await admin.firestore()
             .collection('subscriptions')
@@ -1335,10 +1352,78 @@ export const handleIncomingSms = functions
 
             const senderName = teamMembers[fromNumber];
             if (!senderName) {
-                // Not from a team member — likely a customer texting the
-                // notification number. Acknowledge without relaying.
-                console.log('Sender not in team members:', fromNumber);
-                respondTwiml();
+                // Not a team member — a customer replying to the notification
+                // line. Instead of dropping it: look them up by phone to find
+                // their department, forward the message to that department's
+                // monitored number (or the team), and auto-reply pointing them
+                // to that number so nothing is lost.
+                console.log('Customer inbound from', fromNumber);
+                const digitsOnly = (s: string) => (s || '').replace(/\D/g, '');
+                const last10 = (s: string) => digitsOnly(s).slice(-10);
+                const toE164 = (s: string): string | null => {
+                    const d = digitsOnly(s);
+                    if (d.length === 10) return `+1${d}`;
+                    if (d.length === 11 && d.startsWith('1')) return `+${d}`;
+                    return null;
+                };
+
+                const fromLast10 = last10(fromNumber);
+                let matchedName = '';
+                let dept = '';
+                try {
+                    const subs = await admin.firestore().collection('subscriptions').get();
+                    let best: any = null;
+                    subs.forEach((doc) => {
+                        const d = doc.data();
+                        if (last10(String(d.customerPhone || '')) === fromLast10) {
+                            if (!best || (d.status === 'active' && best.status !== 'active')) best = d;
+                        }
+                    });
+                    if (best) {
+                        matchedName = String(best.customerName || '');
+                        dept = String(best.department || '');
+                    }
+                } catch (e) {
+                    console.error('customer subscription lookup failed:', e);
+                }
+
+                let monitoredPhone = '';
+                if (dept) {
+                    try {
+                        const cfg = await admin.firestore()
+                            .collection('department_config').doc(dept).get();
+                        if (cfg.exists) monitoredPhone = String((cfg.data() as any)?.monitoredPhone || '');
+                    } catch (e) {
+                        console.error('department_config lookup failed:', e);
+                    }
+                }
+
+                // Forward the reply so a human actually sees it.
+                if (messageBody || mediaUrls.length > 0) {
+                    const who = matchedName ? `${matchedName} (${fromNumber})` : fromNumber;
+                    const tag = dept ? ` [${capitalize(dept)}]` : '';
+                    const mediaNote = mediaUrls.length > 0 ? ` (+${mediaUrls.length} attachment(s))` : '';
+                    const fwd = messageBody
+                        ? `📩 Customer reply from ${who}${tag}: ${messageBody}${mediaNote}`
+                        : `📩 Customer ${who}${tag} sent ${mediaUrls.length} attachment(s)`;
+                    const target = toE164(monitoredPhone);
+                    const targets = target ? [target] : recipientPhoneNumbers;
+                    try {
+                        const client = twilio(twilioSid.value().trim(), authToken);
+                        await Promise.allSettled(targets.map((to) =>
+                            client.messages.create({ body: fwd, from: twilioNumber, to })
+                        ));
+                        console.log(`Forwarded customer reply to ${targets.join(', ')}`);
+                    } catch (e) {
+                        console.error('customer reply forward failed:', e);
+                    }
+                }
+
+                // Auto-reply once, pointing them to a monitored number.
+                const callNumber = monitoredPhone || '(559) 809-1230';
+                const esc = (s: string) => s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+                const reply = `Thanks for reaching out to Suarez Lawn Services! This number isn't monitored for replies — please call or text us directly at ${callNumber} and we'll get right back to you.`;
+                res.status(200).type('text/xml').send(`<Response><Message>${esc(reply)}</Message></Response>`);
                 return;
             }
 
