@@ -16,6 +16,11 @@ const gmailPass = defineSecret('GMAIL_PASS');
 const twilioSid = defineSecret('TWILIO_SID');
 const twilioToken = defineSecret('TWILIO_TOKEN');
 const twilioPhone = defineSecret('TWILIO_PHONE');
+// Shared bearer token that authenticates calls to the Next.js cron endpoints.
+// Must equal the CRON_SECRET env var set in the Vercel project (Vercel used to
+// send this header automatically for vercel.json crons; the every-15-min
+// scheduled-sms job now lives here instead — see scheduledSmsRelay below).
+const cronSecret = defineSecret('CRON_SECRET');
 
 const allSecrets = [gmailPass, twilioSid, twilioToken, twilioPhone];
 
@@ -600,6 +605,51 @@ export const monthlyChecklistReport = functions
                 ],
             }
         );
+
+        return null;
+    });
+
+
+/**
+ * Scheduled relay for the customer scheduled-SMS queue.
+ *
+ * Vercel's Hobby plan only allows once-daily crons, so the every-15-minutes
+ * scheduled-sms poll can't live in vercel.json. This runs on Cloud Scheduler
+ * instead and simply pings the existing Next.js endpoint
+ * (GET /api/cron/scheduled-sms) with the shared CRON_SECRET bearer token — all
+ * the send/re-arm logic stays in the Next.js app; this is just the heartbeat.
+ *
+ * The endpoint is itself gated behind SCHEDULED_SMS_ENABLED (dry-run until set),
+ * so enabling actual sends is still a one-flag change in Vercel, unaffected by
+ * this function.
+ */
+const SCHEDULED_SMS_ENDPOINT = 'https://www.suarezlawnservices.com/api/cron/scheduled-sms';
+
+export const scheduledSmsRelay = functions
+    .runWith({ secrets: [cronSecret], timeoutSeconds: 120 })
+    .pubsub.schedule('*/15 * * * *')
+    .timeZone('America/Los_Angeles')
+    .onRun(async () => {
+        const secret = cronSecret.value().trim();
+        if (!secret) {
+            console.error('[scheduledSmsRelay] CRON_SECRET is empty — skipping run');
+            return null;
+        }
+
+        try {
+            const res = await fetch(SCHEDULED_SMS_ENDPOINT, {
+                method: 'GET',
+                headers: { authorization: `Bearer ${secret}` },
+            });
+            const bodyText = await res.text();
+            if (!res.ok) {
+                console.error(`[scheduledSmsRelay] endpoint returned ${res.status}: ${bodyText.slice(0, 500)}`);
+            } else {
+                console.log(`[scheduledSmsRelay] ok: ${bodyText.slice(0, 500)}`);
+            }
+        } catch (error: any) {
+            console.error('[scheduledSmsRelay] request failed:', error?.message || error);
+        }
 
         return null;
     });
