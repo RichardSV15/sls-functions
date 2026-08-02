@@ -157,6 +157,25 @@ function neighborOfferDetails(
     add('Card special', d.neighborOfferSlug ? String(d.neighborOfferSlug) : 'unknown batch');
     add('Plan picked', d.planType ? formatPlanType(String(d.planType)) : null);
 
+    // The next date this street's rotation offers (stamped by the claim route
+    // from the zone schedule, 'YYYY-MM-DD'). It's the date to tell the
+    // customer, and what a rush request is jumping ahead of. Parsed as LOCAL
+    // date parts — new Date('YYYY-MM-DD') reads UTC midnight and would render
+    // the previous day in Pacific.
+    const nextSvcRaw = d.neighborOffer?.nextServiceDate;
+    if (typeof nextSvcRaw === 'string' && /^\d{4}-\d{2}-\d{2}$/.test(nextSvcRaw)) {
+        const [y, m, day] = nextSvcRaw.split('-').map(Number);
+        const label = new Date(y, m - 1, day).toLocaleDateString('en-US', {
+            timeZone: 'America/Los_Angeles',
+            weekday: 'short', month: 'short', day: 'numeric',
+        });
+        add(
+            'Next route visit',
+            `${label} — the customer was told this street's rotation date`,
+            label
+        );
+    }
+
     // On this flow the card photo IS the price — the crew hand-wrote it for
     // that specific house and we honor whatever it says. No photo means nobody
     // knows what was promised.
@@ -979,10 +998,11 @@ export const sendCompletionNotification = functions
         }
         // Tighter free-text budget on card leads so the block above plus the
         // notes still fit under the 1,000-char cap. Measured worst case (long
-        // name/email/address, every option selected, bonus not honored) lands
-        // just under it; anything past that only ever eats the trailing free
-        // text and ID line, never the link or the card block.
-        const freeTextMax = neighborSmsLines.length > 0 ? 100 : 200;
+        // name/email/address, every option selected, bonus not honored, next
+        // route date) lands just under it; anything past that only ever eats
+        // the trailing free text and ID line, never the link or the card
+        // block. Full notes are always in the email + dashboard link.
+        const freeTextMax = neighborSmsLines.length > 0 ? 80 : 200;
 
         if (newValue.optionalDetails) smsLines.push(`Optional: ${truncateForSms(newValue.optionalDetails, freeTextMax)}`);
         if (newValue.additionalInfo) smsLines.push(`Additional: ${truncateForSms(newValue.additionalInfo, freeTextMax)}`);
