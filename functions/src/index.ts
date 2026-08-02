@@ -34,7 +34,7 @@ const recipientEmails = ['RichardSV15@gmail.com', 'DanielSV17@gmail.com', 'Suare
 
 // Recipient phone numbers — get notification SMS blasts AND relayed team
 // replies (see handleIncomingSms). +15598091230 is the RS Office line.
-const recipientPhoneNumbers = ['+15595675330', '+15595677354', '+15592136764', '+15598091230'];
+const recipientPhoneNumbers = ['+15595675330', '+15595677354', '+15592136764', '+15592419140', '+15598091230'];
 // Map of team member phone numbers to names — recognized senders for the relay
 const teamMembers: { [phoneNumber: string]: string } = {
     '+15595675330': 'Richard',
@@ -80,6 +80,165 @@ function formatDate(dateValue: any): string {
 function capitalize(str: string): string {
     if (!str) return str;
     return str.charAt(0).toUpperCase() + str.slice(1);
+}
+
+
+// ── Card special ("Friends & Neighbors") extras ──
+
+/**
+ * Payment methods offered on the card-special page. Collected as a PREFERENCE
+ * only — that page never takes a payment. Mirrors PAYMENT_OPTIONS in the
+ * Next.js app (lib/specials/types.ts).
+ */
+const PAYMENT_PREF_LABELS: Record<string, string> = {
+    zelle: 'Zelle',
+    venmo: 'Venmo',
+    cashapp: 'Cash App',
+    card: 'Credit / Debit (3% fee)',
+    cash: 'Cash',
+    check: 'Check',
+};
+
+/**
+ * The bonus authorization (POST /api/specials/claim in the Next.js app) stamps
+ * `neighborOffer` onto the request a beat AFTER the doc is created, so this
+ * onCreate trigger races it. Wait briefly for the stamp rather than telling the
+ * office "pending" on every single card lead — but keep the wait short: a lead
+ * alert that arrives late is worse than one missing the honored flag.
+ */
+async function awaitNeighborOfferStamp(
+    ref: FirebaseFirestore.DocumentReference,
+    data: any
+): Promise<any> {
+    if (!data || data.source !== 'neighbor_offer' || data.neighborOffer) return data;
+    for (let attempt = 0; attempt < 5; attempt++) {
+        await new Promise((resolve) => setTimeout(resolve, 800));
+        try {
+            const fresh = (await ref.get()).data();
+            if (fresh?.neighborOffer) return fresh;
+        } catch (error) {
+            console.error('Error re-reading request for neighborOffer stamp:', error);
+            break;
+        }
+    }
+    return data;
+}
+
+/**
+ * Everything a card-special lead selected that exists NOWHERE else.
+ *
+ * The handwritten card price lives only in the photo, the bonus is labor the
+ * crew actually has to perform, rush changes which day the truck goes, and the
+ * back yard is a quote request rather than part of the booked plan. If these
+ * don't ride along in the office SMS/email, the only way to see them is to open
+ * the dashboard — which defeats the point of the alert.
+ *
+ * Each row carries two phrasings on purpose. The email is read at a desk and
+ * gets the full sentence; the SMS shares a hard character budget with the rest
+ * of the alert (a 2026-06-10 oversized body was silently dropped by the carrier
+ * — Twilio 30019), so it gets the terse one. `smsValue: null` means email-only.
+ */
+function neighborOfferDetails(
+    d: any
+): { label: string; value: string; smsValue: string | null }[] {
+    if (!d || d.source !== 'neighbor_offer') return [];
+
+    const rows: { label: string; value: string; smsValue: string | null }[] = [];
+    const add = (
+        label: string,
+        value: string | null | undefined,
+        smsValue?: string | null
+    ) => {
+        if (value) {
+            rows.push({ label, value, smsValue: smsValue === undefined ? value : smsValue });
+        }
+    };
+
+    add('Card special', d.neighborOfferSlug ? String(d.neighborOfferSlug) : 'unknown batch');
+    add('Plan picked', d.planType ? formatPlanType(String(d.planType)) : null);
+
+    // On this flow the card photo IS the price — the crew hand-wrote it for
+    // that specific house and we honor whatever it says. No photo means nobody
+    // knows what was promised.
+    add(
+        'Card price photo',
+        d.special_offer_photo_url
+            ? 'ATTACHED — read the handwritten price off it'
+            : 'MISSING — confirm the price with the customer before scheduling',
+        d.special_offer_photo_url ? 'attached (price is on it)' : 'MISSING — confirm price first'
+    );
+    if (typeof d.zonePricePerVisit === 'number' && d.zonePricePerVisit > 0) {
+        add(
+            'Zone price (reference)',
+            `$${d.zonePricePerVisit}/visit for this address — never billed, use it to sanity-check the card`,
+            `$${d.zonePricePerVisit}/visit (not billed — sanity-check the card)`
+        );
+    }
+    if (typeof d.zoneMonthlyEstimateCents === 'number' && d.zoneMonthlyEstimateCents > 0) {
+        // Email only, and the "/mo" is load-bearing: a recurring lead's value is
+        // an INCREASE IN MRR, never a one-time job total.
+        add('Est. value at zone price', `${formatPrice(d.zoneMonthlyEstimateCents)}/mo`, null);
+    }
+
+    // The `neighborOffer` stamp is the authority (server clock decided whether
+    // the window was still open); `neighborOfferBonusRequested` is only what
+    // the customer tapped.
+    const stamped = d.neighborOffer;
+    if (stamped && stamped.bonusId) {
+        const label = String(stamped.bonusLabel || stamped.bonusId).replace(/\*\*/g, '');
+        const visit = stamped.bonusVisit ? ` on visit ${stamped.bonusVisit}` : '';
+        add(
+            'Bonus',
+            stamped.bonusHonored
+                ? `${label}${visit} — HONORED, crew owes this`
+                : `${label}${visit} — window closed, NOT owed (tell them before the visit)`,
+            stamped.bonusHonored
+                ? `${label}${visit} — OWED`
+                : `${label}${visit} — NOT owed (window closed)`
+        );
+    } else if (d.neighborOfferBonusRequested) {
+        add(
+            'Bonus',
+            `${d.neighborOfferBonusRequested} — picked, authorization still pending (check the dashboard)`,
+            `${d.neighborOfferBonusRequested} — pending, see dashboard`
+        );
+    } else {
+        add('Bonus', 'none picked');
+    }
+
+    if (d.rushRequested) {
+        const fee = typeof d.rushFeeUsd === 'number' ? d.rushFeeUsd : 10;
+        add(
+            'RUSH',
+            `wants a visit THIS WEEK instead of the next route pass (+$${fee} one time)`,
+            `wants a visit THIS WEEK (+$${fee})`
+        );
+    }
+
+    add('Pays by', d.preferredPayment
+        ? (PAYMENT_PREF_LABELS[String(d.preferredPayment)] || String(d.preferredPayment))
+        : null);
+
+    if (d.backYardRequested) {
+        const flags = [
+            d.backYardGateLocked ? 'gate has a lock' : '',
+            d.backYardPets ? 'pets in back' : '',
+        ].filter(Boolean).join(', ');
+        const suffix = flags ? ` · ${flags}` : '';
+        add(
+            'Back yard',
+            `QUOTE REQUESTED, not booked — ${
+                d.backYardPricing === 'on_site'
+                    ? 'price it during the first front-yard visit'
+                    : 'photos attached'
+            }${suffix}`,
+            `QUOTE ONLY — ${
+                d.backYardPricing === 'on_site' ? 'price on 1st visit' : 'photos attached'
+            }${suffix}`
+        );
+    }
+
+    return rows;
 }
 
 
@@ -663,13 +822,32 @@ export const sendCompletionNotification = functions
     .firestore
     .document('serviceRequests/{requestId}')
     .onCreate(async (snapshot, context) => {
-        const newValue = snapshot.data();
+        let newValue = snapshot.data();
         const requestId = context.params.requestId;
 
         if (!newValue) {
             console.error('No data found in the new service request.');
             return null;
         }
+
+        // Card-special leads get their bonus authorized a beat after the doc is
+        // written — give that stamp a moment to land so the office alert can say
+        // whether the bonus is actually owed. No-op for every other request.
+        newValue = await awaitNeighborOfferStamp(snapshot.ref, newValue);
+
+        const neighborRows = neighborOfferDetails(newValue);
+        const neighborEmailRows = neighborRows.length
+            ? `
+            <tr>
+            <td colspan="2" style="padding: 8px; border: 1px solid #ddd; background: #f1f5ec;"><strong>Card Special — customer selections</strong></td>
+            </tr>
+            ${neighborRows.map((r) => `
+            <tr>
+            <td style="padding: 8px; border: 1px solid #ddd;"><strong>${r.label}:</strong></td>
+            <td style="padding: 8px; border: 1px solid #ddd;">${r.value}</td>
+            </tr>
+            `).join('')}`
+            : '';
 
         // Extract fields with default values
         const serviceType = newValue.serviceType || 'N/A';
@@ -738,7 +916,7 @@ export const sendCompletionNotification = functions
             <td style="padding: 8px; border: 1px solid #ddd;"><strong>Additional Details:</strong></td>
             <td style="padding: 8px; border: 1px solid #ddd;">${newValue.additionalInfo ? newValue.additionalInfo : 'N/A'}</td>
             </tr>
-            
+            ${neighborEmailRows}
             ${customerEmail !== 'N/A' ? `
             <tr>
             <td style="padding: 8px; border: 1px solid #ddd;"><strong>Customer Email:</strong></td>
@@ -785,12 +963,37 @@ export const sendCompletionNotification = functions
         // Link goes BEFORE the free-text details so it survives any truncation.
         smsLines.push(`https://www.suarezlawnservices.com/service-request/${requestId}`);
         if (customerEmail !== 'N/A') smsLines.push(`Email: ${customerEmail}`);
-        if (newValue.optionalDetails) smsLines.push(`Optional: ${truncateForSms(newValue.optionalDetails, 200)}`);
-        if (newValue.additionalInfo) smsLines.push(`Additional: ${truncateForSms(newValue.additionalInfo, 200)}`);
+
+        // Card-special selections sit AFTER the link (so the link always
+        // survives truncation) but BEFORE the customer's free text, which is the
+        // only part safe to lose — the bonus, the rush and the missing-card-photo
+        // warning all change what the crew does.
+        const neighborSmsLines = neighborRows
+            .filter((r) => r.smsValue)
+            .map((r) => `${r.label}: ${r.smsValue}`);
+        if (neighborSmsLines.length > 0) {
+            smsLines.push('');
+            smsLines.push('-- Card special --');
+            smsLines.push(...neighborSmsLines);
+            smsLines.push('');
+        }
+        // Tighter free-text budget on card leads so the block above plus the
+        // notes still fit under the 1,000-char cap. Measured worst case (long
+        // name/email/address, every option selected, bonus not honored) lands
+        // just under it; anything past that only ever eats the trailing free
+        // text and ID line, never the link or the card block.
+        const freeTextMax = neighborSmsLines.length > 0 ? 100 : 200;
+
+        if (newValue.optionalDetails) smsLines.push(`Optional: ${truncateForSms(newValue.optionalDetails, freeTextMax)}`);
+        if (newValue.additionalInfo) smsLines.push(`Additional: ${truncateForSms(newValue.additionalInfo, freeTextMax)}`);
         if (Array.isArray(newValue.request_photo_urls) && newValue.request_photo_urls.length > 0) {
             smsLines.push(`Additional images: ${newValue.request_photo_urls.length}`);
         }
-        if (newValue.special_offer_photo_url != null) smsLines.push('Promo image: Yes!');
+        // The card block already says whether the price photo landed — don't say
+        // it twice on a neighbor lead.
+        if (newValue.special_offer_photo_url != null && neighborSmsLines.length === 0) {
+            smsLines.push('Promo image: Yes!');
+        }
         smsLines.push(`ID: ${requestId}`);
         let textMessageBody = smsLines.join('\n');
         // Final safety cap — well under Twilio's 1,600-char limit and carrier
