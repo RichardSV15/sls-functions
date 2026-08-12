@@ -5,6 +5,8 @@ import { defineSecret } from 'firebase-functions/params';
 import * as admin from 'firebase-admin';
 import * as nodemailer from 'nodemailer';
 import twilio from 'twilio';
+import { prepareSmsBody } from './sms-text';
+import { summarizeServiceRequest } from './ai-digest';
 const PdfPrinter = require('pdfmake');
 
 
@@ -21,8 +23,11 @@ const twilioPhone = defineSecret('TWILIO_PHONE');
 // send this header automatically for vercel.json crons; the every-15-min
 // scheduled-sms job now lives here instead — see scheduledSmsRelay below).
 const cronSecret = defineSecret('CRON_SECRET');
+// Optional. Powers the concise service-request digest in the office SMS; when
+// unset the alert falls back to the enumerated body and nothing breaks.
+const anthropicKey = defineSecret('ANTHROPIC_API_KEY');
 
-const allSecrets = [gmailPass, twilioSid, twilioToken, twilioPhone];
+const allSecrets = [gmailPass, twilioSid, twilioToken, twilioPhone, anthropicKey];
 
 // Email config
 const gmailUser = "RichardSV15@gmail.com";
@@ -951,10 +956,35 @@ export const sendCompletionNotification = functions
         // project description pushed a request SMS past the carrier content
         // limit (Twilio error 30019) on 2026-06-10 and ALL recipients silently
         // missed it. Full details are always in the email + dashboard link.
+        //
+        // sendSMS() now also GSM-7 sanitizes and segment-caps every body, so the
+        // caps here are about keeping the alert readable, not about delivery.
         const truncateForSms = (text: string, max: number): string => {
             const s = String(text).trim();
-            return s.length > max ? `${s.slice(0, max).trimEnd()}… [see email/link]` : s;
+            return s.length > max ? `${s.slice(0, max).trimEnd()}... [see email/link]` : s;
         };
+
+        const requestPhotoCount = Array.isArray(newValue.request_photo_urls)
+            ? newValue.request_photo_urls.length
+            : 0;
+
+        // One Haiku call turns the selected options plus the customer's notes
+        // into a couple of readable lines. Null means the model was unavailable
+        // or had nothing to work with, and we fall through to the enumeration.
+        const aiDigest = await summarizeServiceRequest(
+            {
+                serviceType,
+                recurringFrequency: newValue.recurringFrequency,
+                recurringServices: newValue.recurringServices,
+                oneTimeServices: newValue.oneTimeServices,
+                landscapingServices: newValue.landscapingServices,
+                optionalDetails: newValue.optionalDetails,
+                additionalInfo: newValue.additionalInfo,
+                photoCount: requestPhotoCount,
+                hasPromoPhoto: newValue.special_offer_photo_url != null,
+            },
+            anthropicKey.value().trim() || undefined
+        );
 
         const smsLines: string[] = [];
         smsLines.push('SLS: New service request!!!');
@@ -964,20 +994,24 @@ export const sendCompletionNotification = functions
         if (newValue.phoneNumber) smsLines.push(`Phone: ${newValue.phoneNumber}`);
         if (newValue.address) smsLines.push(`Address: ${newValue.address}`);
         smsLines.push('');
-        smsLines.push(`Wants: ${serviceType} service`);
-        if (newValue.recurringFrequency) smsLines.push(`Frequency: ${newValue.recurringFrequency}`);
+        if (aiDigest) {
+            smsLines.push(aiDigest);
+        } else {
+            smsLines.push(`Wants: ${serviceType} service`);
+            if (newValue.recurringFrequency) smsLines.push(`Frequency: ${newValue.recurringFrequency}`);
 
-        if (Array.isArray(newValue.recurringServices) && newValue.recurringServices.length > 0) {
-            newValue.recurringServices.forEach((item: string) => {
-                if (item) smsLines.push(`- ${item}`);
-            });
-        } else if (typeof newValue.recurringServices === 'string' && newValue.recurringServices.trim().length > 0) {
-            smsLines.push(`Recurring: ${newValue.recurringServices}`);
+            if (Array.isArray(newValue.recurringServices) && newValue.recurringServices.length > 0) {
+                newValue.recurringServices.forEach((item: string) => {
+                    if (item) smsLines.push(`- ${item}`);
+                });
+            } else if (typeof newValue.recurringServices === 'string' && newValue.recurringServices.trim().length > 0) {
+                smsLines.push(`Recurring: ${newValue.recurringServices}`);
+            }
+            // Guard with String(... || '') — legacy docs may omit these fields, and a
+            // throw here means NO notification at all.
+            if (String(newValue.oneTimeServices || '').length > 0) smsLines.push(`One-time: ${newValue.oneTimeServices}`);
+            if (String(newValue.landscapingServices || '').length > 0) smsLines.push(`Landscape: ${newValue.landscapingServices}`);
         }
-        // Guard with String(... || '') — legacy docs may omit these fields, and a
-        // throw here means NO notification at all.
-        if (String(newValue.oneTimeServices || '').length > 0) smsLines.push(`One-time: ${newValue.oneTimeServices}`);
-        if (String(newValue.landscapingServices || '').length > 0) smsLines.push(`Landscape: ${newValue.landscapingServices}`);
         smsLines.push('');
         // Link goes BEFORE the free-text details so it survives any truncation.
         smsLines.push(`https://www.suarezlawnservices.com/service-request/${requestId}`);
@@ -1004,23 +1038,25 @@ export const sendCompletionNotification = functions
         // block. Full notes are always in the email + dashboard link.
         const freeTextMax = neighborSmsLines.length > 0 ? 80 : 200;
 
-        if (newValue.optionalDetails) smsLines.push(`Optional: ${truncateForSms(newValue.optionalDetails, freeTextMax)}`);
-        if (newValue.additionalInfo) smsLines.push(`Additional: ${truncateForSms(newValue.additionalInfo, freeTextMax)}`);
-        if (Array.isArray(newValue.request_photo_urls) && newValue.request_photo_urls.length > 0) {
-            smsLines.push(`Additional images: ${newValue.request_photo_urls.length}`);
-        }
-        // The card block already says whether the price photo landed — don't say
-        // it twice on a neighbor lead.
-        if (newValue.special_offer_photo_url != null && neighborSmsLines.length === 0) {
-            smsLines.push('Promo image: Yes!');
+        // The digest already folded the notes and the photo count in; repeating
+        // them raw is what made the old body long in the first place.
+        if (!aiDigest) {
+            if (newValue.optionalDetails) smsLines.push(`Optional: ${truncateForSms(newValue.optionalDetails, freeTextMax)}`);
+            if (newValue.additionalInfo) smsLines.push(`Additional: ${truncateForSms(newValue.additionalInfo, freeTextMax)}`);
+            if (requestPhotoCount > 0) {
+                smsLines.push(`Additional images: ${requestPhotoCount}`);
+            }
+            // The card block already says whether the price photo landed — don't say
+            // it twice on a neighbor lead.
+            if (newValue.special_offer_photo_url != null && neighborSmsLines.length === 0) {
+                smsLines.push('Promo image: Yes!');
+            }
         }
         smsLines.push(`ID: ${requestId}`);
-        let textMessageBody = smsLines.join('\n');
-        // Final safety cap — well under Twilio's 1,600-char limit and carrier
-        // segment caps. The link sits early in the body, so it always survives.
-        if (textMessageBody.length > 1000) {
-            textMessageBody = `${textMessageBody.slice(0, 1000).trimEnd()}…`;
-        }
+        const textMessageBody = smsLines.join('\n');
+        // sendSMS() applies the GSM-7 sanitize + 6-segment cap for us, so there
+        // is no second length guard here. Doing it twice is how the old `…`
+        // suffix got introduced and forced UCS-2 (Twilio 30019).
 
         const mode = newValue.mode || 'live';
 
@@ -1819,9 +1855,12 @@ async function sendSMS(
 ): Promise<string[]> {
     const client = twilio(twilioSid.value().trim(), twilioToken.value().trim());
     const targets = options?.to || recipientPhoneNumbers;
+    // Every outbound SMS goes through here, so this is the one place that can
+    // guarantee we never hand Twilio a UCS-2 body again (see sms-text.ts).
+    const safeBody = prepareSmsBody(body);
     const messages = await Promise.all(targets.map((phoneNumber) =>
         client.messages.create({
-            body: body,
+            body: safeBody,
             from: twilioPhone.value().trim(),
             to: phoneNumber,
             ...(options?.statusCallback ? { statusCallback: options.statusCallback } : {}),
