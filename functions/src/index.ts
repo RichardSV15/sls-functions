@@ -5,6 +5,8 @@ import { defineSecret } from 'firebase-functions/params';
 import * as admin from 'firebase-admin';
 import * as nodemailer from 'nodemailer';
 import twilio from 'twilio';
+import { prepareSmsBody } from './sms-text';
+import { summarizeServiceRequest } from './ai-digest';
 const PdfPrinter = require('pdfmake');
 
 
@@ -21,8 +23,11 @@ const twilioPhone = defineSecret('TWILIO_PHONE');
 // send this header automatically for vercel.json crons; the every-15-min
 // scheduled-sms job now lives here instead — see scheduledSmsRelay below).
 const cronSecret = defineSecret('CRON_SECRET');
+// Optional. Powers the concise service-request digest in the office SMS; when
+// unset the alert falls back to the enumerated body and nothing breaks.
+const anthropicKey = defineSecret('ANTHROPIC_API_KEY');
 
-const allSecrets = [gmailPass, twilioSid, twilioToken, twilioPhone];
+const allSecrets = [gmailPass, twilioSid, twilioToken, twilioPhone, anthropicKey];
 
 // Email config
 const gmailUser = "RichardSV15@gmail.com";
@@ -260,6 +265,155 @@ function neighborOfferDetails(
     return rows;
 }
 
+
+
+/**
+ * A truck-scan doc is written at the GATE — the moment the customer hands over
+ * their details, BEFORE they've seen the price and decided. So this onCreate
+ * trigger fires on what is often still just a lead, and the answer to "did they
+ * actually book?" lands seconds to minutes later (POST /api/truck/complete, or
+ * the Stripe webhook).
+ *
+ * Waiting ~30s here means the common case — someone who reads the price and
+ * taps yes right away — produces ONE text that says BOOKED, instead of a lead
+ * text followed by a booking text. A slower decider still gets the lead text
+ * now, and the completion route sends the booking one when they finish.
+ *
+ * A lead alert arriving 30s late costs nothing; nobody dispatches a crew in
+ * thirty seconds. Two texts for one customer costs attention, which is the
+ * scarce thing.
+ */
+async function awaitTruckBookingStamp(
+    ref: FirebaseFirestore.DocumentReference,
+    data: any
+): Promise<any> {
+    if (!data || data.source !== 'truck_scan' || data.leadStage === 'booked') return data;
+    for (let attempt = 0; attempt < 20; attempt++) {
+        await new Promise((resolve) => setTimeout(resolve, 1500));
+        try {
+            const fresh = (await ref.get()).data();
+            if (fresh?.leadStage === 'booked') return fresh;
+        } catch (error) {
+            console.error('Error re-reading request for truck booking stamp:', error);
+            break;
+        }
+    }
+    return data;
+}
+
+/**
+ * Everything a truck-scan lead decided that exists nowhere else in the alert.
+ *
+ * The two facts that change what the office DOES are at the top: whether this
+ * is a booking or just a lead, and the price we quoted them. Unlike the card
+ * special — where the handwritten photo is the price — this number came from
+ * our own zone pricing, so the office is committed to it and must not quote
+ * something different when they call.
+ *
+ * Same two-phrasing convention as neighborOfferDetails(): the email gets the
+ * sentence, the SMS gets the terse form, `smsValue: null` means email-only.
+ */
+function truckScanDetails(
+    d: any
+): { label: string; value: string; smsValue: string | null }[] {
+    if (!d || d.source !== 'truck_scan') return [];
+
+    const rows: { label: string; value: string; smsValue: string | null }[] = [];
+    const add = (
+        label: string,
+        value: string | null | undefined,
+        smsValue?: string | null
+    ) => {
+        if (value) {
+            rows.push({ label, value, smsValue: smsValue === undefined ? value : smsValue });
+        }
+    };
+
+    const booked = d.leadStage === 'booked';
+    const booking = d.truckBooking || {};
+    const price = typeof booking.pricePerVisit === 'number' && booking.pricePerVisit > 0
+        ? booking.pricePerVisit
+        : (typeof d.zonePricePerVisit === 'number' && d.zonePricePerVisit > 0
+            ? d.zonePricePerVisit
+            : null);
+
+    // Which truck earned this scan. One QR slug per truck, so this is how a
+    // decal (and the route it drives) gets credit for the lead.
+    add(
+        'Truck',
+        d.truckCode ? String(d.truckCode) : 'unknown (scanned without a truck code)',
+        d.truckCode ? String(d.truckCode) : 'unknown code'
+    );
+
+    if (booked) {
+        // How they said yes decides who does what next. A card customer is
+        // already on autopay; a text-first customer needs the office to set
+        // billing up by hand, and nobody has taken money from them yet.
+        const path = booking.bookingPath;
+        if (path === 'stripe') {
+            add('Booked via', 'CARD ON FILE — Stripe checkout completed, autopay is live', 'CARD on file (autopay live)');
+        } else if (path === 'stripe_started') {
+            add(
+                'Booked via',
+                'started card checkout but has NOT paid — treat as a hot lead, not a customer',
+                'started checkout, NOT paid'
+            );
+        } else {
+            add(
+                'Booked via',
+                'NO CARD — they asked us to text them. Office sets up billing.',
+                'NO CARD — office sets up billing'
+            );
+        }
+    } else {
+        add(
+            'Stage',
+            'LEAD ONLY — gave us their details and saw the price, has not booked',
+            'LEAD only (saw price, no booking)'
+        );
+    }
+
+    add('Plan', d.planType ? formatPlanType(String(d.planType)) : null);
+
+    if (price) {
+        // We quoted this off zone pricing, so it is what we owe them.
+        add(
+            'Price we QUOTED',
+            `$${price}/visit — this is the number shown on their screen, honor it`,
+            `$${price}/visit — QUOTED, honor it`
+        );
+    } else {
+        add(
+            'Price we QUOTED',
+            'none — address is outside our route pricing, so they were told we would text a quote',
+            'none — OUT OF AREA, owes a quote'
+        );
+    }
+
+    // The date the page told them. Local date parts — new Date('YYYY-MM-DD')
+    // reads UTC midnight and renders the previous day in Pacific.
+    const nextSvcRaw = booking.nextServiceDate;
+    if (typeof nextSvcRaw === 'string' && /^\d{4}-\d{2}-\d{2}$/.test(nextSvcRaw)) {
+        const [y, m, day] = nextSvcRaw.split('-').map(Number);
+        const label = new Date(y, m - 1, day).toLocaleDateString('en-US', {
+            timeZone: 'America/Los_Angeles',
+            weekday: 'short', month: 'short', day: 'numeric',
+        });
+        add('First visit told', `${label} — the date shown on their screen`, label);
+    }
+
+    // The gate takes phone OR email, so an alert with no phone is normal here
+    // and the office needs to know to reply by email instead of calling.
+    if (!d.phoneNumber) {
+        add(
+            'No phone given',
+            'they left email only — reply by email, there is no number to call',
+            'EMAIL ONLY (no phone)'
+        );
+    }
+
+    return rows;
+}
 
 
 function getPdfFonts() {
@@ -837,7 +991,10 @@ export const scheduledSmsRelay = functions
  * Cloud Function to send an email upon service request creation.
  */
 export const sendCompletionNotification = functions
-    .runWith({ secrets: allSecrets })
+    // 120s: a truck-scan lead waits up to ~30s for the booking stamp (see
+    // awaitTruckBookingStamp) on top of the AI digest + email + SMS, which
+    // would otherwise crowd the default 60s budget.
+    .runWith({ secrets: allSecrets, timeoutSeconds: 120 })
     .firestore
     .document('serviceRequests/{requestId}')
     .onCreate(async (snapshot, context) => {
@@ -854,13 +1011,34 @@ export const sendCompletionNotification = functions
         // whether the bonus is actually owed. No-op for every other request.
         newValue = await awaitNeighborOfferStamp(snapshot.ref, newValue);
 
+        // Truck-scan docs are written at the GATE, before the customer has
+        // decided — wait briefly so a fast yes produces one BOOKED text
+        // instead of a lead text chased by a booking text.
+        newValue = await awaitTruckBookingStamp(snapshot.ref, newValue);
+        const isTruckScan = newValue.source === 'truck_scan';
+        const truckBooked = isTruckScan && newValue.leadStage === 'booked';
+
         const neighborRows = neighborOfferDetails(newValue);
+        const truckRows = truckScanDetails(newValue);
         const neighborEmailRows = neighborRows.length
             ? `
             <tr>
             <td colspan="2" style="padding: 8px; border: 1px solid #ddd; background: #f1f5ec;"><strong>Card Special — customer selections</strong></td>
             </tr>
             ${neighborRows.map((r) => `
+            <tr>
+            <td style="padding: 8px; border: 1px solid #ddd;"><strong>${r.label}:</strong></td>
+            <td style="padding: 8px; border: 1px solid #ddd;">${r.value}</td>
+            </tr>
+            `).join('')}`
+            : '';
+
+        const truckEmailRows = truckRows.length
+            ? `
+            <tr>
+            <td colspan="2" style="padding: 8px; border: 1px solid #ddd; background: #f1f5ec;"><strong>Truck Scan — ${truckBooked ? 'BOOKED' : 'lead only'}</strong></td>
+            </tr>
+            ${truckRows.map((r) => `
             <tr>
             <td style="padding: 8px; border: 1px solid #ddd;"><strong>${r.label}:</strong></td>
             <td style="padding: 8px; border: 1px solid #ddd;">${r.value}</td>
@@ -888,7 +1066,9 @@ export const sendCompletionNotification = functions
             : 'N/A';
 
         const messageBody = `
-            <h2>New Service Request Created</h2>
+            <h2>${isTruckScan
+                ? (truckBooked ? 'Truck Scan — BOOKED' : 'Truck Scan — lead (no booking yet)')
+                : 'New Service Request Created'}</h2>
             <p>A new service request has been created with the following details:</p>
             <table style="width: 100%; border-collapse: collapse;">
             <tr>
@@ -936,6 +1116,7 @@ export const sendCompletionNotification = functions
             <td style="padding: 8px; border: 1px solid #ddd;">${newValue.additionalInfo ? newValue.additionalInfo : 'N/A'}</td>
             </tr>
             ${neighborEmailRows}
+            ${truckEmailRows}
             ${customerEmail !== 'N/A' ? `
             <tr>
             <td style="padding: 8px; border: 1px solid #ddd;"><strong>Customer Email:</strong></td>
@@ -951,33 +1132,70 @@ export const sendCompletionNotification = functions
         // project description pushed a request SMS past the carrier content
         // limit (Twilio error 30019) on 2026-06-10 and ALL recipients silently
         // missed it. Full details are always in the email + dashboard link.
+        //
+        // sendSMS() now also GSM-7 sanitizes and segment-caps every body, so the
+        // caps here are about keeping the alert readable, not about delivery.
         const truncateForSms = (text: string, max: number): string => {
             const s = String(text).trim();
-            return s.length > max ? `${s.slice(0, max).trimEnd()}… [see email/link]` : s;
+            return s.length > max ? `${s.slice(0, max).trimEnd()}... [see email/link]` : s;
         };
 
+        const requestPhotoCount = Array.isArray(newValue.request_photo_urls)
+            ? newValue.request_photo_urls.length
+            : 0;
+
+        // One Haiku call turns the selected options plus the customer's notes
+        // into a couple of readable lines. Null means the model was unavailable
+        // or had nothing to work with, and we fall through to the enumeration.
+        // Truck-scan leads carry no free text (the gate asks four fields), and
+        // the truck block below already states the plan, the price and the
+        // stage. A digest there would just spend SMS characters restating
+        // "recurring lawn maintenance".
+        const aiDigest = isTruckScan ? null : await summarizeServiceRequest(
+            {
+                serviceType,
+                recurringFrequency: newValue.recurringFrequency,
+                recurringServices: newValue.recurringServices,
+                oneTimeServices: newValue.oneTimeServices,
+                landscapingServices: newValue.landscapingServices,
+                optionalDetails: newValue.optionalDetails,
+                additionalInfo: newValue.additionalInfo,
+                photoCount: requestPhotoCount,
+                hasPromoPhoto: newValue.special_offer_photo_url != null,
+            },
+            anthropicKey.value().trim() || undefined
+        );
+
         const smsLines: string[] = [];
-        smsLines.push('SLS: New service request!!!');
+        smsLines.push(
+            isTruckScan
+                ? (truckBooked ? 'SLS: TRUCK SCAN — BOOKED!' : 'SLS: Truck scan lead (not booked)')
+                : 'SLS: New service request!!!'
+        );
         smsLines.push('');
         if (formattedTimestamp !== 'N/A') smsLines.push(`Time: ${formattedTimestamp}`);
         smsLines.push(`Name: ${customerName}`);
         if (newValue.phoneNumber) smsLines.push(`Phone: ${newValue.phoneNumber}`);
         if (newValue.address) smsLines.push(`Address: ${newValue.address}`);
         smsLines.push('');
-        smsLines.push(`Wants: ${serviceType} service`);
-        if (newValue.recurringFrequency) smsLines.push(`Frequency: ${newValue.recurringFrequency}`);
+        if (aiDigest) {
+            smsLines.push(aiDigest);
+        } else {
+            smsLines.push(`Wants: ${serviceType} service`);
+            if (newValue.recurringFrequency) smsLines.push(`Frequency: ${newValue.recurringFrequency}`);
 
-        if (Array.isArray(newValue.recurringServices) && newValue.recurringServices.length > 0) {
-            newValue.recurringServices.forEach((item: string) => {
-                if (item) smsLines.push(`- ${item}`);
-            });
-        } else if (typeof newValue.recurringServices === 'string' && newValue.recurringServices.trim().length > 0) {
-            smsLines.push(`Recurring: ${newValue.recurringServices}`);
+            if (Array.isArray(newValue.recurringServices) && newValue.recurringServices.length > 0) {
+                newValue.recurringServices.forEach((item: string) => {
+                    if (item) smsLines.push(`- ${item}`);
+                });
+            } else if (typeof newValue.recurringServices === 'string' && newValue.recurringServices.trim().length > 0) {
+                smsLines.push(`Recurring: ${newValue.recurringServices}`);
+            }
+            // Guard with String(... || '') — legacy docs may omit these fields, and a
+            // throw here means NO notification at all.
+            if (String(newValue.oneTimeServices || '').length > 0) smsLines.push(`One-time: ${newValue.oneTimeServices}`);
+            if (String(newValue.landscapingServices || '').length > 0) smsLines.push(`Landscape: ${newValue.landscapingServices}`);
         }
-        // Guard with String(... || '') — legacy docs may omit these fields, and a
-        // throw here means NO notification at all.
-        if (String(newValue.oneTimeServices || '').length > 0) smsLines.push(`One-time: ${newValue.oneTimeServices}`);
-        if (String(newValue.landscapingServices || '').length > 0) smsLines.push(`Landscape: ${newValue.landscapingServices}`);
         smsLines.push('');
         // Link goes BEFORE the free-text details so it survives any truncation.
         smsLines.push(`https://www.suarezlawnservices.com/service-request/${requestId}`);
@@ -996,31 +1214,48 @@ export const sendCompletionNotification = functions
             smsLines.push(...neighborSmsLines);
             smsLines.push('');
         }
+
+        // Same placement rule as the card block: after the link (so the link
+        // survives truncation), before any free text. Every row here changes
+        // what the office does — whether to call or email, whether money has
+        // been taken, and the price we already committed to on screen.
+        const truckSmsLines = truckRows
+            .filter((r) => r.smsValue)
+            .map((r) => `${r.label}: ${r.smsValue}`);
+        if (truckSmsLines.length > 0) {
+            smsLines.push('');
+            smsLines.push('-- Truck scan --');
+            smsLines.push(...truckSmsLines);
+            smsLines.push('');
+        }
         // Tighter free-text budget on card leads so the block above plus the
         // notes still fit under the 1,000-char cap. Measured worst case (long
         // name/email/address, every option selected, bonus not honored, next
         // route date) lands just under it; anything past that only ever eats
         // the trailing free text and ID line, never the link or the card
         // block. Full notes are always in the email + dashboard link.
-        const freeTextMax = neighborSmsLines.length > 0 ? 80 : 200;
+        const freeTextMax =
+            neighborSmsLines.length > 0 || truckSmsLines.length > 0 ? 80 : 200;
 
-        if (newValue.optionalDetails) smsLines.push(`Optional: ${truncateForSms(newValue.optionalDetails, freeTextMax)}`);
-        if (newValue.additionalInfo) smsLines.push(`Additional: ${truncateForSms(newValue.additionalInfo, freeTextMax)}`);
-        if (Array.isArray(newValue.request_photo_urls) && newValue.request_photo_urls.length > 0) {
-            smsLines.push(`Additional images: ${newValue.request_photo_urls.length}`);
-        }
-        // The card block already says whether the price photo landed — don't say
-        // it twice on a neighbor lead.
-        if (newValue.special_offer_photo_url != null && neighborSmsLines.length === 0) {
-            smsLines.push('Promo image: Yes!');
+        // The digest already folded the notes and the photo count in; repeating
+        // them raw is what made the old body long in the first place.
+        if (!aiDigest) {
+            if (newValue.optionalDetails) smsLines.push(`Optional: ${truncateForSms(newValue.optionalDetails, freeTextMax)}`);
+            if (newValue.additionalInfo) smsLines.push(`Additional: ${truncateForSms(newValue.additionalInfo, freeTextMax)}`);
+            if (requestPhotoCount > 0) {
+                smsLines.push(`Additional images: ${requestPhotoCount}`);
+            }
+            // The card block already says whether the price photo landed — don't say
+            // it twice on a neighbor lead.
+            if (newValue.special_offer_photo_url != null && neighborSmsLines.length === 0) {
+                smsLines.push('Promo image: Yes!');
+            }
         }
         smsLines.push(`ID: ${requestId}`);
-        let textMessageBody = smsLines.join('\n');
-        // Final safety cap — well under Twilio's 1,600-char limit and carrier
-        // segment caps. The link sits early in the body, so it always survives.
-        if (textMessageBody.length > 1000) {
-            textMessageBody = `${textMessageBody.slice(0, 1000).trimEnd()}…`;
-        }
+        const textMessageBody = smsLines.join('\n');
+        // sendSMS() applies the GSM-7 sanitize + 6-segment cap for us, so there
+        // is no second length guard here. Doing it twice is how the old `…`
+        // suffix got introduced and forced UCS-2 (Twilio 30019).
 
         const mode = newValue.mode || 'live';
 
@@ -1029,6 +1264,13 @@ export const sendCompletionNotification = functions
             // dashboard can show delivery status instead of failures being
             // invisible (Twilio "accepted" ≠ delivered).
             const notifications: Record<string, unknown> = {};
+            // What this alert actually announced. POST /api/truck/complete
+            // reads it: if the office was told "lead" and the customer books
+            // afterwards, that booking owes them a second text — and if they
+            // were already told "BOOKED", it must not send one.
+            if (isTruckScan) {
+                notifications.truckStage = truckBooked ? 'booked' : 'contact';
+            }
 
             console.log('LIVE MODE: Sending email');
             try {
@@ -1819,9 +2061,12 @@ async function sendSMS(
 ): Promise<string[]> {
     const client = twilio(twilioSid.value().trim(), twilioToken.value().trim());
     const targets = options?.to || recipientPhoneNumbers;
+    // Every outbound SMS goes through here, so this is the one place that can
+    // guarantee we never hand Twilio a UCS-2 body again (see sms-text.ts).
+    const safeBody = prepareSmsBody(body);
     const messages = await Promise.all(targets.map((phoneNumber) =>
         client.messages.create({
-            body: body,
+            body: safeBody,
             from: twilioPhone.value().trim(),
             to: phoneNumber,
             ...(options?.statusCallback ? { statusCallback: options.statusCallback } : {}),
