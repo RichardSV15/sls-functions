@@ -1259,6 +1259,35 @@ export const sendCompletionNotification = functions
 
         const mode = newValue.mode || 'live';
 
+        // A truck-scan doc that has not booked is a LEAD, and leads do not
+        // interrupt anyone. The gate writes a doc for everyone who hands over
+        // their details — that is the point of the page — so alerting on each
+        // one would text the office for every scanner who looked at a price
+        // and walked. They are all sitting in /admin/requests, and the
+        // completion route texts the moment one actually books.
+        const suppressLeadAlert = isTruckScan && !truckBooked;
+
+        if (mode === 'live' && suppressLeadAlert) {
+            // Still record the stage, so POST /api/truck/complete knows no
+            // booking has been announced yet and must send its own.
+            try {
+                await snapshot.ref.set(
+                    {
+                        notifications: {
+                            truckStage: 'contact',
+                            suppressed: 'lead_only',
+                            at: admin.firestore.FieldValue.serverTimestamp(),
+                        },
+                    },
+                    { merge: true }
+                );
+            } catch (error) {
+                console.error('Error recording suppressed truck lead:', error);
+            }
+            console.log(`Truck-scan LEAD (not booked) ${requestId} — alert suppressed`);
+            return null;
+        }
+
         if (mode === 'live') {
             // Per-channel result, written back to the request doc so the admin
             // dashboard can show delivery status instead of failures being
