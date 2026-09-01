@@ -39,11 +39,21 @@ const recipientEmails = ['RichardSV15@gmail.com', 'DanielSV17@gmail.com', 'Suare
 
 // Recipient phone numbers — get notification SMS blasts AND relayed team
 // replies (see handleIncomingSms). +15598091230 is the RS Office line.
-const recipientPhoneNumbers = ['+15595675330', '+15595677354', '+15592136764', '+15592419140', '+15598091230'];
-// Map of team member phone numbers to names — recognized senders for the relay
+//
+// Keep this in step with TEAM_RECIPIENTS in the website repo
+// (lib/notifications/team-sms.ts): alerts are split across the two codebases,
+// so a number added to only one gets some alerts and not others.
+const recipientPhoneNumbers = ['+15595675330', '+15595677354', '+15595675328', '+15592136764', '+15592419140', '+15598091230'];
+// Map of team member phone numbers to names — recognized senders for the relay.
+//
+// A number must appear in BOTH lists to be a full member: this map is what makes
+// an incoming text a recognized team message, while the list above is who
+// receives. In one and not the other means someone who can listen but not speak
+// (or the reverse).
 const teamMembers: { [phoneNumber: string]: string } = {
     '+15595675330': 'Richard',
     '+15595677354': 'Daniel',
+    '+15595675328': 'Daniel (personal)',
     '+15592136764': 'Julia',
     '+15592419140': 'Inocencio',
     '+15598091230': 'RS Office'
