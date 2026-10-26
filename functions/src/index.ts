@@ -64,6 +64,19 @@ const teamMembers: { [phoneNumber: string]: string } = {
 // ── Utility Helpers ──
 
 /** Map plan type slug to human-readable label */
+/**
+ * The team's test home address. Same rule as the website's
+ * lib/analytics/test-identities.ts (keep the two copies the same): street line
+ * "27 Burgan Ave" in any town, or the half-typed "27 Burgan"; never
+ * "27 North Burgan Ave" or "127 Burgan Ave".
+ */
+function isTestAddress(address: unknown): boolean {
+    if (typeof address !== 'string' || !address.trim()) return false;
+    const first = address.split(',')[0].toLowerCase()
+        .replace(/[.#]/g, ' ').replace(/\bavenue\b/g, 'ave').replace(/\s+/g, ' ').trim();
+    return first === '27 burgan ave' || first.startsWith('27 burgan ave ') || first === '27 burgan';
+}
+
 function formatPlanType(planType: string): string {
     const labels: Record<string, string> = {
         'front_biweekly': 'Front Yard - Every 2 Weeks',
@@ -1013,6 +1026,21 @@ export const sendCompletionNotification = functions
 
         if (!newValue) {
             console.error('No data found in the new service request.');
+            return null;
+        }
+
+        // A request at the test home address texts and emails no one (Richard,
+        // 2026-10-25). It still shows on /admin/requests with a TEST badge.
+        if (isTestAddress(newValue.address)) {
+            try {
+                await snapshot.ref.set(
+                    { notifications: { suppressed: 'test_address', at: admin.firestore.FieldValue.serverTimestamp() } },
+                    { merge: true }
+                );
+            } catch (error) {
+                console.error('Error recording suppressed test request:', error);
+            }
+            console.log(`Test-address request ${requestId} — no team alert`);
             return null;
         }
 
