@@ -1575,6 +1575,16 @@ export const sendPaymentReceivedNotification = functions
             return null;
         }
 
+        // A $0 invoice is not a payment. The website's charge-time realign
+        // moves a plan's billing moment with trial_end, and Stripe closes the
+        // old period with a $0 invoice: every plan at once after a DST change
+        // (13 "Payment received $0.00" texts on 2026-09-21). A new plan's $0
+        // first invoice is already announced by sendNewSubscriptionNotification.
+        if ((paymentData.amountPaid || 0) <= 0) {
+            console.log(`Payment ${context.params.paymentId} on ${subId} is $0 (${paymentData.billingReason || 'no billing reason'}), no team alert`);
+            return null;
+        }
+
         // Respect the admin "Payment Received" team-alert toggle
         // (settings/notifications.paymentReceivedAlertEnabled, surfaced at
         // /admin/notifications). Fail-open: if the doc is missing or unreadable,
