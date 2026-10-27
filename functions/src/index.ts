@@ -1740,11 +1740,24 @@ export const onSubscriptionStatusChange = functions
     });
 
 
-/** Send payment failed notification to the team */
+/**
+ * Email the team about a failed payment. No text: the website's
+ * `invoice.payment_failed` webhook sends the ONE team text (with phone,
+ * address, plan and the retry link), on every failed attempt. This function
+ * used to text too, so the team got two texts for each first failure
+ * (2026-10-27). The email stays.
+ */
 async function notifyPaymentFailed(
     subId: string,
     data: FirebaseFirestore.DocumentData
 ): Promise<void> {
+    // One invoice covers every property on a bundled plan, and the webhook
+    // marks each property's doc payment_failed — email once, from the plan's
+    // own doc, not once per property.
+    if (data.lineRole === 'additional') {
+        console.log(`Payment failed on an additional property (${subId}) — the plan's own doc emails`);
+        return;
+    }
     const customerName = data.customerName || 'N/A';
     const customerPhone = data.customerPhone || 'N/A';
     const address = data.address || 'N/A';
@@ -1784,39 +1797,19 @@ async function notifyPaymentFailed(
             <td style="padding: 8px; border: 1px solid #ddd;">${formatPlanType(planType)}</td>
         </tr>
         <tr>
-            <td style="padding: 8px; border: 1px solid #ddd;"><strong>Price:</strong></td>
-            <td style="padding: 8px; border: 1px solid #ddd;">${formatPrice(priceInCents)}</td>
+            <td style="padding: 8px; border: 1px solid #ddd;"><strong>Amount:</strong></td>
+            <td style="padding: 8px; border: 1px solid #ddd;">${formatPrice(amountCents)}</td>
         </tr>
         </table>
         ${fixLink ? `<p><strong>Send the customer this link to update their card and retry:</strong><br><a href="${fixLink}">${fixLink}</a></p>` : ''}
         <p><a href="${adminLink}">View in Admin Panel</a></p>
     `;
 
-    const smsBody = [
-        'SLS: Payment FAILED!',
-        '',
-        `Customer: ${customerName}`,
-        `Phone: ${customerPhone}`,
-        `Address: ${address}`,
-        `Plan: ${formatPlanType(planType)}`,
-        `Amount: ${formatPrice(amountCents)}`,
-        // The link alone on its own line, so a long press copies just it.
-        ...(fixLink ? ['', 'Send the customer this link to update their card and retry:', fixLink, ''] : []),
-        `Plan page: ${adminLink}`,
-    ].join('\n');
-
     try {
         await sendEmail(`Payment Failed - ${customerName}`, emailHtml);
         console.log('Payment failed email sent');
     } catch (error) {
         console.error('Error sending payment failed email:', error);
-    }
-
-    try {
-        await sendSMS(smsBody);
-        console.log('Payment failed SMS sent');
-    } catch (error) {
-        console.error('Error sending payment failed SMS:', error);
     }
 }
 
