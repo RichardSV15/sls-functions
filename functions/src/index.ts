@@ -1751,6 +1751,17 @@ async function notifyPaymentFailed(
     const planType = data.planType || 'N/A';
     const priceInCents = data.priceInCents || 0;
     const adminLink = `https://www.suarezlawnservices.com/admin/subscriptions/${subId}`;
+    // The customer's "update your card and retry" link. The website's webhook
+    // writes `paymentFixToken` in the SAME update that sets payment_failed, so it
+    // is on afterData here (website: lib/stripe/payment-fix.ts). It never
+    // expires; a Stripe portal URL would be dead by the time the office sent it.
+    const token = typeof data.paymentFixToken === 'string' ? data.paymentFixToken : '';
+    const fixLink = /^[A-Za-z0-9_-]{32}$/.test(token)
+        ? `https://www.suarezlawnservices.com/pay/${token}`
+        : '';
+    const amountCents = typeof data.lastFailedAmountCents === 'number' && data.lastFailedAmountCents > 0
+        ? data.lastFailedAmountCents
+        : priceInCents;
 
     const emailHtml = `
         <h2 style="color: #d32f2f;">Payment Failed</h2>
@@ -1777,6 +1788,7 @@ async function notifyPaymentFailed(
             <td style="padding: 8px; border: 1px solid #ddd;">${formatPrice(priceInCents)}</td>
         </tr>
         </table>
+        ${fixLink ? `<p><strong>Send the customer this link to update their card and retry:</strong><br><a href="${fixLink}">${fixLink}</a></p>` : ''}
         <p><a href="${adminLink}">View in Admin Panel</a></p>
     `;
 
@@ -1787,8 +1799,10 @@ async function notifyPaymentFailed(
         `Phone: ${customerPhone}`,
         `Address: ${address}`,
         `Plan: ${formatPlanType(planType)}`,
-        `Price: ${formatPrice(priceInCents)}`,
-        adminLink,
+        `Amount: ${formatPrice(amountCents)}`,
+        // The link alone on its own line, so a long press copies just it.
+        ...(fixLink ? ['', 'Send the customer this link to update their card and retry:', fixLink, ''] : []),
+        `Plan page: ${adminLink}`,
     ].join('\n');
 
     try {
