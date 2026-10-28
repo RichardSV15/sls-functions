@@ -79,10 +79,14 @@ function isTestAddress(address: unknown): boolean {
 
 function formatPlanType(planType: string): string {
     const labels: Record<string, string> = {
+        // Never "Monthly": every plan is per visit, every 2 or 4 weeks. Same
+        // names as the website's formatPlanName.
         'front_biweekly': 'Front Yard - Every 2 Weeks',
-        'front_monthly': 'Front Yard - Monthly',
+        'front_monthly': 'Front Yard - Every 4 Weeks',
         'front_back_biweekly': 'Front + Back Yard - Every 2 Weeks',
-        'front_back_monthly': 'Front + Back Yard - Monthly',
+        'front_back_monthly': 'Front + Back Yard - Every 4 Weeks',
+        'back_biweekly': 'Back Yard Only - Every 2 Weeks',
+        'back_monthly': 'Back Yard Only - Every 4 Weeks',
     };
     return labels[planType] || planType;
 }
@@ -1468,7 +1472,36 @@ export const twilioSmsStatus = functions
 
 
 /**
- * Cloud Function to notify the team when a new Stripe subscription is created.
+ * How a new plan doc came to exist — the first line of the team alert, so an
+ * office-added property never reads as a new customer.
+ */
+function newPlanHeadline(data: FirebaseFirestore.DocumentData): string {
+    if (data.lineRole === 'additional') return 'Property added to a plan';
+    if (data.syncedFromStripe) return 'Plan synced from Stripe (not new)';
+    switch (data.createdVia) {
+        case 'checkout': return 'New plan, booked online!';
+        case 'admin_custom_link': return 'New plan, paid on an office link';
+        case 'admin_convert': return 'New plan, office converted a customer';
+        case 'admin_add_service': return 'New plan, office added a property';
+        default: return 'New plan';
+    }
+}
+
+/** '2026-11-04' -> 'Wednesday, Nov 4'. The doc already holds the Pacific day. */
+function formatServiceDate(ymd: string): string {
+    const m = /^(\d{4})-(\d{2})-(\d{2})$/.exec(ymd || '');
+    if (!m) return ymd || 'N/A';
+    return new Date(Date.UTC(+m[1], +m[2] - 1, +m[3])).toLocaleDateString('en-US', {
+        weekday: 'long', month: 'short', day: 'numeric', timeZone: 'UTC',
+    });
+}
+
+/**
+ * The ONE team alert (text + email) for a new plan. Every new
+ * `subscriptions/{subId}` doc lands here: a website checkout, an office custom
+ * link, an office convert, and a property the office adds. The website webhook
+ * stopped sending its own team alert on 2026-10-28 (it still sends the
+ * customer's welcome email), because every new plan texted the team twice.
  * Triggers on: subscriptions/{subId} — onCreate
  */
 export const sendNewSubscriptionNotification = functions
@@ -1484,6 +1517,23 @@ export const sendNewSubscriptionNotification = functions
             return null;
         }
 
+        // The admin "New Subscription" toggle (settings/notifications
+        // .newSubscriptionAlertEnabled, /admin/notifications). Fail-open, like
+        // the payment-received toggle: a missing or unreadable doc sends.
+        try {
+            const settingsSnap = await admin.firestore()
+                .collection('settings')
+                .doc('notifications')
+                .get();
+            if (settingsSnap.exists && settingsSnap.data()?.newSubscriptionAlertEnabled === false) {
+                console.log('New-plan team alert disabled via settings, skipping');
+                return null;
+            }
+        } catch (err) {
+            console.error('Could not read notification settings, defaulting to send:', err);
+        }
+
+        const headline = newPlanHeadline(data);
         const customerName = data.customerName || 'N/A';
         const customerPhone = data.customerPhone || 'N/A';
         const customerEmail = data.customerEmail || 'N/A';
@@ -1491,85 +1541,55 @@ export const sendNewSubscriptionNotification = functions
         const planType = data.planType || 'N/A';
         const priceInCents = data.priceInCents || 0;
         const serviceDay = data.serviceDay || 'N/A';
-        const nextServiceDate = data.nextServiceDate || 'N/A';
+        const firstVisit = formatServiceDate(data.nextServiceDate || '');
         const zoneName = data.zoneName || 'N/A';
         const department = data.department || 'N/A';
         const referredByCode = data.referredByCode || null;
         const adminLink = `https://www.suarezlawnservices.com/admin/subscriptions/${subId}`;
 
+        const row = (label: string, value: string) => `
+            <tr>
+                <td style="padding: 8px; border: 1px solid #ddd;"><strong>${label}:</strong></td>
+                <td style="padding: 8px; border: 1px solid #ddd;">${value}</td>
+            </tr>`;
+
         // HTML email
         const emailHtml = `
-            <h2>New Subscription</h2>
-            <p>A new customer has subscribed to lawn services:</p>
+            <h2>${headline}</h2>
             <table style="width: 100%; border-collapse: collapse;">
-            <tr>
-                <td style="padding: 8px; border: 1px solid #ddd;"><strong>Customer:</strong></td>
-                <td style="padding: 8px; border: 1px solid #ddd;">${customerName}</td>
-            </tr>
-            <tr>
-                <td style="padding: 8px; border: 1px solid #ddd;"><strong>Phone:</strong></td>
-                <td style="padding: 8px; border: 1px solid #ddd;">${customerPhone}</td>
-            </tr>
-            <tr>
-                <td style="padding: 8px; border: 1px solid #ddd;"><strong>Email:</strong></td>
-                <td style="padding: 8px; border: 1px solid #ddd;">${customerEmail}</td>
-            </tr>
-            <tr>
-                <td style="padding: 8px; border: 1px solid #ddd;"><strong>Address:</strong></td>
-                <td style="padding: 8px; border: 1px solid #ddd;">${address}</td>
-            </tr>
-            <tr>
-                <td style="padding: 8px; border: 1px solid #ddd;"><strong>Plan:</strong></td>
-                <td style="padding: 8px; border: 1px solid #ddd;">${formatPlanType(planType)}</td>
-            </tr>
-            <tr>
-                <td style="padding: 8px; border: 1px solid #ddd;"><strong>Price:</strong></td>
-                <td style="padding: 8px; border: 1px solid #ddd;">${formatPrice(priceInCents)}</td>
-            </tr>
-            <tr>
-                <td style="padding: 8px; border: 1px solid #ddd;"><strong>Service Day:</strong></td>
-                <td style="padding: 8px; border: 1px solid #ddd;">${capitalize(serviceDay)}</td>
-            </tr>
-            <tr>
-                <td style="padding: 8px; border: 1px solid #ddd;"><strong>First Service Date:</strong></td>
-                <td style="padding: 8px; border: 1px solid #ddd;">${nextServiceDate}</td>
-            </tr>
-            <tr>
-                <td style="padding: 8px; border: 1px solid #ddd;"><strong>Zone:</strong></td>
-                <td style="padding: 8px; border: 1px solid #ddd;">${zoneName}</td>
-            </tr>
-            <tr>
-                <td style="padding: 8px; border: 1px solid #ddd;"><strong>Department:</strong></td>
-                <td style="padding: 8px; border: 1px solid #ddd;">${capitalize(department)}</td>
-            </tr>
-            ${referredByCode ? `
-            <tr>
-                <td style="padding: 8px; border: 1px solid #ddd;"><strong>Referred By:</strong></td>
-                <td style="padding: 8px; border: 1px solid #ddd;">${referredByCode}</td>
-            </tr>
-            ` : ''}
+            ${row('Customer', customerName)}
+            ${row('Phone', customerPhone)}
+            ${row('Email', customerEmail)}
+            ${row('Address', address)}
+            ${row('Plan', formatPlanType(planType))}
+            ${row('Price', `${formatPrice(priceInCents)} per visit`)}
+            ${row('Service Day', capitalize(serviceDay))}
+            ${row('First Visit', firstVisit)}
+            ${row('Zone', zoneName)}
+            ${row('Department', capitalize(department))}
+            ${referredByCode ? row('Referred By', referredByCode) : ''}
             </table>
             <p><a href="${adminLink}">View in Admin Panel</a></p>
         `;
 
         // SMS
         const smsLines: string[] = [];
-        smsLines.push('SLS: New subscription!');
+        smsLines.push(`SLS: ${headline}`);
         smsLines.push('');
         smsLines.push(`Customer: ${customerName}`);
         smsLines.push(`Phone: ${customerPhone}`);
         smsLines.push(`Address: ${address}`);
         smsLines.push(`Plan: ${formatPlanType(planType)}`);
-        smsLines.push(`Price: ${formatPrice(priceInCents)}`);
+        smsLines.push(`Price: ${formatPrice(priceInCents)} per visit`);
         smsLines.push(`Service Day: ${capitalize(serviceDay)}`);
-        smsLines.push(`First Service: ${nextServiceDate}`);
+        smsLines.push(`First Visit: ${firstVisit}`);
         smsLines.push(`Zone: ${zoneName}  Dept: ${capitalize(department)}`);
         if (referredByCode) smsLines.push(`Referred by: ${referredByCode}`);
         smsLines.push(adminLink);
         const smsBody = smsLines.join('\n');
 
         try {
-            await sendEmail(`New Subscription - ${customerName}`, emailHtml);
+            await sendEmail(`${headline} - ${customerName}`, emailHtml);
             console.log('New subscription email sent');
         } catch (error) {
             console.error('Error sending new subscription email:', error);
